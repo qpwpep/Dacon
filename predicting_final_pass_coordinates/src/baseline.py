@@ -54,7 +54,7 @@ def euclidean_loss_meters(
     eps: float = 1e-9,
 ) -> torch.Tensor:
     """
-    pred_norm/true_norm: [B, 2] (0~1로 정규화된 좌표)
+    pred_norm/true_norm: [B, 2] (정규화 좌표; absolute(0~1) 또는 delta(-1~1) 모두 OK)
     return: 평균 유클리드 거리 (미터 스케일)
     """
     dx = (pred_norm[:, 0] - true_norm[:, 0]) * field_x
@@ -129,7 +129,7 @@ def build_train_episodes(
         game_id = int(str(game_episode).split("_", 1)[0])
         episode_game_ids.append(game_id)
 
-        # --- absolute normalized coords (0~1) ---
+                # --- absolute normalized coords (0~1) ---
         sx_abs = (g["start_x"].values / field_x).astype(np.float32)  # type: ignore
         sy_abs = (g["start_y"].values / field_y).astype(np.float32)  # type: ignore
         ex_abs = (g["end_x"].values / field_x).astype(np.float32)    # type: ignore
@@ -140,13 +140,13 @@ def build_train_episodes(
         anchor_y = float(sy_abs[-1])
 
         # --- anchor-relative coords (delta coordinate frame) ---
-        sx = (sx_abs - anchor_x).astype(np.float32)
-        sy = (sy_abs - anchor_y).astype(np.float32)
-        ex = (ex_abs - anchor_x).astype(np.float32)
-        ey = (ey_abs - anchor_y).astype(np.float32)
+        sx_rel = (sx_abs - anchor_x).astype(np.float32)
+        sy_rel = (sy_abs - anchor_y).astype(np.float32)
+        ex_rel = (ex_abs - anchor_x).astype(np.float32)
+        ey_rel = (ey_abs - anchor_y).astype(np.float32)
 
         # 타깃: 마지막 row의 end를 anchor 기준 델타로 예측
-        tgt = np.asarray([float(ex[-1]), float(ey[-1])], dtype=np.float32)
+        tgt = np.asarray([float(ex_rel[-1]), float(ey_rel[-1])], dtype=np.float32)
         targets.append(tgt)
 
         T = len(g)
@@ -155,14 +155,20 @@ def build_train_episodes(
         end_mask = np.ones((T,), dtype=np.float32)
         end_mask[-1] = 0.0
 
-        ex_filled = ex.copy()
-        ey_filled = ey.copy()
-        # 마지막 row는 end가 없다고 가정 -> (start와 동일) => 상대좌표계에선 (0,0)
-        ex_filled[-1] = 0.0
-        ey_filled[-1] = 0.0
+        # absolute end filled: last row는 end가 없다고 가정 -> start로 채움
+        ex_abs_filled = ex_abs.copy()
+        ey_abs_filled = ey_abs.copy()
+        ex_abs_filled[-1] = sx_abs[-1]
+        ey_abs_filled[-1] = sy_abs[-1]
 
-        dx = np.where(end_mask > 0, ex - sx, 0.0).astype(np.float32)
-        dy = np.where(end_mask > 0, ey - sy, 0.0).astype(np.float32)
+        # relative end filled: last row는 (0,0)으로
+        ex_rel_filled = ex_rel.copy()
+        ey_rel_filled = ey_rel.copy()
+        ex_rel_filled[-1] = 0.0
+        ey_rel_filled[-1] = 0.0
+
+        dx = np.where(end_mask > 0, ex_rel - sx_rel, 0.0).astype(np.float32)
+        dy = np.where(end_mask > 0, ey_rel - sy_rel, 0.0).astype(np.float32)
         dist = np.sqrt(dx * dx + dy * dy).astype(np.float32)
 
         ang = np.arctan2(dy, dx).astype(np.float32)
@@ -182,10 +188,27 @@ def build_train_episodes(
         anchor_y_feat = np.full((T,), anchor_y, dtype=np.float32)
 
         num = np.stack(
-            [sx, sy, ex_filled, ey_filled, end_mask, dx, dy, dist, angle_sin, angle_cos, dt, anchor_x_feat, anchor_y_feat],
+            [
+                sx_abs,
+                sy_abs,
+                ex_abs_filled,
+                ey_abs_filled,
+                sx_rel,
+                sy_rel,
+                ex_rel_filled,
+                ey_rel_filled,
+                end_mask,
+                dx,
+                dy,
+                dist,
+                angle_sin,
+                angle_cos,
+                dt,
+                anchor_x_feat,
+                anchor_y_feat,
+            ],
             axis=1,
-        ).astype(np.float32)  # [T, 11]
-
+        ).astype(np.float32)  # [T, 17]
         cat = np.stack(
             [
                 map_idx(g, "player_id", vocabs["player_id"]),
@@ -221,7 +244,7 @@ def build_test_sequence_from_path(
     if max_tail_k and max_tail_k > 0:
         g = g.tail(int(max_tail_k)).reset_index(drop=True)
 
-    # --- absolute normalized coords (0~1) ---
+        # --- absolute normalized coords (0~1) ---
     sx_abs = (g["start_x"].values / field_x).astype(np.float32)  # type: ignore
     sy_abs = (g["start_y"].values / field_y).astype(np.float32)  # type: ignore
 
@@ -233,21 +256,30 @@ def build_test_sequence_from_path(
 
     ex_abs = (np.nan_to_num(ex_raw, nan=0.0) / field_x).astype(np.float32) # type: ignore
     ey_abs = (np.nan_to_num(ey_raw, nan=0.0) / field_y).astype(np.float32) # type: ignore
+    # NaN end는 start로 채움 (absolute frame)
     ex_abs = np.where(end_mask > 0, ex_abs, sx_abs)
     ey_abs = np.where(end_mask > 0, ey_abs, sy_abs)
+
+    # absolute end filled (for input)
+    ex_abs_filled = ex_abs
+    ey_abs_filled = ey_abs
 
     # Anchor = 마지막 action의 start(정규화)
     anchor_x = float(sx_abs[-1])
     anchor_y = float(sy_abs[-1])
 
-    # --- anchor-relative coords ---
-    sx = (sx_abs - anchor_x).astype(np.float32)
-    sy = (sy_abs - anchor_y).astype(np.float32)
-    ex = (ex_abs - anchor_x).astype(np.float32)
-    ey = (ey_abs - anchor_y).astype(np.float32)
+    # --- anchor-relative coords (delta frame) ---
+    sx_rel = (sx_abs - anchor_x).astype(np.float32)
+    sy_rel = (sy_abs - anchor_y).astype(np.float32)
+    ex_rel = (ex_abs_filled - anchor_x).astype(np.float32)
+    ey_rel = (ey_abs_filled - anchor_y).astype(np.float32)
 
-    dx = np.where(end_mask > 0, ex - sx, 0.0).astype(np.float32)
-    dy = np.where(end_mask > 0, ey - sy, 0.0).astype(np.float32)
+    # relative end filled: end가 없으면 0 (relative frame)
+    ex_rel_filled = np.where(end_mask > 0, ex_rel, 0.0).astype(np.float32)
+    ey_rel_filled = np.where(end_mask > 0, ey_rel, 0.0).astype(np.float32)
+
+    dx = np.where(end_mask > 0, ex_rel - sx_rel, 0.0).astype(np.float32)
+    dy = np.where(end_mask > 0, ey_rel - sy_rel, 0.0).astype(np.float32)
     dist = np.sqrt(dx * dx + dy * dy).astype(np.float32)
 
     ang = np.arctan2(dy, dx).astype(np.float32)
@@ -267,9 +299,27 @@ def build_test_sequence_from_path(
     anchor_y_feat = np.full((T,), anchor_y, dtype=np.float32)
 
     num = np.stack(
-        [sx, sy, ex, ey, end_mask, dx, dy, dist, angle_sin, angle_cos, dt, anchor_x_feat, anchor_y_feat],
+        [
+            sx_abs,
+            sy_abs,
+            ex_abs_filled,
+            ey_abs_filled,
+            sx_rel,
+            sy_rel,
+            ex_rel_filled,
+            ey_rel_filled,
+            end_mask,
+            dx,
+            dy,
+            dist,
+            angle_sin,
+            angle_cos,
+            dt,
+            anchor_x_feat,
+            anchor_y_feat,
+        ],
         axis=1,
-    ).astype(np.float32)  # [T, 13]
+    ).astype(np.float32)  # [T, 17]
 
     def map_idx(col: str, vocab: dict) -> np.ndarray:
         vals = g[col].fillna("None").astype(str).values
@@ -570,7 +620,7 @@ def main(cfg: DictConfig) -> None:
     # -----------------
     # Model / Optim
     # -----------------
-    numeric_dim = int(episodes_num_train[0].shape[1])  # 11
+    numeric_dim = int(episodes_num_train[0].shape[1])  # 13
     # emb_dims는 config(model.emb_dims)에서 가져오고, 없으면 기본값 사용
     if "emb_dims" in cfg.model and cfg.model.emb_dims is not None:
         emb_dims = OmegaConf.to_container(cfg.model.emb_dims, resolve=True)  # type: ignore
