@@ -73,8 +73,11 @@ def build_vocabs(train_csv_path: str):
         # NaN 처리 + str 통일
         vals = series.fillna("None").astype(str).unique().tolist()
         vals = sorted(vals)
-        # 0은 UNK/PAD
-        return {v: i+1 for i, v in enumerate(vals)}
+        # 인덱스 규칙:
+        #   0 = PAD (padding only)
+        #   1 = UNK (OOV/미등록 값)
+        #   2.. = 실제 카테고리 값
+        return {v: i + 2 for i, v in enumerate(vals)}
 
     vocabs = {
         "player_id": make_map(df["player_id"]),
@@ -82,7 +85,7 @@ def build_vocabs(train_csv_path: str):
         "type_name": make_map(df["type_name"]),
         "result_name": make_map(df["result_name"]),
     }
-    sizes = {k: (len(v)+1) for k, v in vocabs.items()}  # +1 for UNK/PAD=0
+    sizes = {k: (len(v) + 2) for k, v in vocabs.items()}  # +2 for PAD(0), UNK(1)
     return vocabs, sizes
 
 
@@ -117,7 +120,7 @@ def build_train_episodes(
 
     def map_idx(g: pd.DataFrame, col: str, vocab: dict) -> np.ndarray:
         vals = g[col].fillna("None").astype(str).values
-        return np.asarray([vocab.get(v, 0) for v in vals], dtype=np.int64)
+        return np.asarray([vocab.get(v, 1) for v in vals], dtype=np.int64)  # default UNK=1
 
     for game_episode, g in tqdm(df.groupby("game_episode"), desc="Build episodes (train)"):
         if max_tail_k and max_tail_k > 0:
@@ -232,7 +235,7 @@ def build_test_sequence_from_path(
 
     def map_idx(col: str, vocab: dict) -> np.ndarray:
         vals = g[col].fillna("None").astype(str).values
-        return np.asarray([vocab.get(v, 0) for v in vals], dtype=np.int64)
+        return np.asarray([vocab.get(v, 1) for v in vals], dtype=np.int64)  # default UNK=1
 
     cat = np.stack(
         [
@@ -487,7 +490,7 @@ def main(cfg: DictConfig) -> None:
     max_tail_k = int(cfg.data.max_tail_k) if "max_tail_k" in cfg.data else 0
 
     episodes_num, episodes_cat, targets, episode_game_ids = build_train_episodes(
-        train_csv_path=train_path, field_x=field_x, field_y=field_y, vocabs=vocabs
+        train_csv_path=train_path, field_x=field_x, field_y=field_y, vocabs=vocabs, max_tail_k=max_tail_k
         )
     print("에피소드 수:", len(episodes_num))
 
