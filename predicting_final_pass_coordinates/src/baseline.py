@@ -154,8 +154,10 @@ def build_train_episodes(
         dist = np.sqrt(dx * dx + dy * dy).astype(np.float32)
 
         ang = np.arctan2(dy, dx).astype(np.float32)
-        angle_sin = np.where(end_mask > 0, np.sin(ang), 0.0).astype(np.float32)
-        angle_cos = np.where(end_mask > 0, np.cos(ang), 0.0).astype(np.float32)
+        eps = 1e-6
+        valid_dir = (end_mask > 0) & (dist > eps)
+        angle_sin = np.where(valid_dir, np.sin(ang), 0.0).astype(np.float32)
+        angle_cos = np.where(valid_dir, np.cos(ang), 0.0).astype(np.float32)
 
         t = g["time_seconds"].values.astype(np.float32)
         dt = np.diff(t, prepend=t[0]) # type: ignore
@@ -220,8 +222,10 @@ def build_test_sequence_from_path(
     dist = np.sqrt(dx * dx + dy * dy).astype(np.float32)
 
     ang = np.arctan2(dy, dx).astype(np.float32)
-    angle_sin = np.where(end_mask > 0, np.sin(ang), 0.0).astype(np.float32)
-    angle_cos = np.where(end_mask > 0, np.cos(ang), 0.0).astype(np.float32)
+    eps = 1e-6
+    valid_dir = (end_mask > 0) & (dist > eps)
+    angle_sin = np.where(valid_dir, np.sin(ang), 0.0).astype(np.float32)
+    angle_cos = np.where(valid_dir, np.cos(ang), 0.0).astype(np.float32)
 
     t = g["time_seconds"].values.astype(np.float32)
     dt = np.diff(t, prepend=t[0]) # type: ignore
