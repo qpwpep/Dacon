@@ -66,29 +66,63 @@ def euclidean_loss_meters(
 # -------------------------
 # Data
 # -------------------------
+def build_vocabs(train_csv_path: str):
+    df = pd.read_csv(train_csv_path)
+
+    def make_map(series):
+        # NaN 처리 + str 통일
+        vals = series.fillna("None").astype(str).unique().tolist()
+        vals = sorted(vals)
+        # 0은 UNK/PAD
+        return {v: i+1 for i, v in enumerate(vals)}
+
+    vocabs = {
+        "player_id": make_map(df["player_id"]),
+        "team_id": make_map(df["team_id"]),
+        "type_name": make_map(df["type_name"]),
+        "result_name": make_map(df["result_name"]),
+    }
+    sizes = {k: (len(v)+1) for k, v in vocabs.items()}  # +1 for UNK/PAD=0
+    return vocabs, sizes
+
+
 def build_train_episodes(
     train_csv_path: str,
     field_x: float,
     field_y: float,
-) -> Tuple[List[np.ndarray], List[np.ndarray], List[int]]:
+    vocabs: dict,
+    max_tail_k: int = 0,
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], List[int]]:
     """
-    train.csv를 읽어서
-      - 입력 시퀀스(액션 토큰): [sx, sy, ex_filled, ey_filled, end_mask]  (정규화)
-        * 마지막 row는 test와 동일하게 end를 비운 상태로 입력 (end_mask=0, ex/ey=0)
-      - 타깃: 마지막 row의 (end_x, end_y) (정규화)
-    를 에피소드 단위로 생성.
+    train.csv -> 에피소드 단위로 시퀀스 생성
+
+    입력 (row 토큰):
+      num: [sx, sy, ex_filled, ey_filled, end_mask, dx, dy, dist, angle_sin, angle_cos, dt]  (정규화/스케일)
+      cat: [player_id, team_id, type_name, result_name] (vocab index; PAD/UNK=0)
+
+    중요한 점:
+      - train도 test와 입력 조건을 맞추기 위해 "마지막 row의 end는 없는 것"으로 처리(end_mask=0, ex/ey=0).
+      - 타깃은 마지막 row의 진짜 end_x/end_y(정규화).
     """
     df = pd.read_csv(train_csv_path)
 
-    # 순서 안정성을 위해 action_id 우선(있다면) + time_seconds
+    # 정렬은 action_id 우선이 안전 (time_seconds가 노이즈인 케이스 방지)
     sort_cols = ["game_episode"] + (["action_id"] if "action_id" in df.columns else []) + ["time_seconds"]
     df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
 
-    episodes: List[np.ndarray] = []
+    episodes_num: List[np.ndarray] = []
+    episodes_cat: List[np.ndarray] = []
     targets: List[np.ndarray] = []
     episode_game_ids: List[int] = []
 
+    def map_idx(g: pd.DataFrame, col: str, vocab: dict) -> np.ndarray:
+        vals = g[col].fillna("None").astype(str).values
+        return np.asarray([vocab.get(v, 0) for v in vals], dtype=np.int64)
+
     for game_episode, g in tqdm(df.groupby("game_episode"), desc="Build episodes (train)"):
+        if max_tail_k and max_tail_k > 0:
+            g = g.tail(int(max_tail_k)).reset_index(drop=True)
+
         game_id = int(str(game_episode).split("_", 1)[0])
         episode_game_ids.append(game_id)
 
@@ -97,13 +131,13 @@ def build_train_episodes(
         ex = (g["end_x"].values / field_x).astype(np.float32)    # type: ignore
         ey = (g["end_y"].values / field_y).astype(np.float32)    # type: ignore
 
-        # 타깃(마지막 row의 진짜 end)
+        # 타깃: 마지막 row의 진짜 end
         tgt = np.asarray([float(ex[-1]), float(ey[-1])], dtype=np.float32)
+        targets.append(tgt)
 
         T = len(g)
 
-        # 입력은 test 조건과 동일하게 만들기 위해:
-        # - 마지막 row의 end는 "없는 것"으로 처리(end_mask=0, ex/ey=0)
+        # 입력은 test와 동일하게: 마지막 end는 비워둠
         end_mask = np.ones((T,), dtype=np.float32)
         end_mask[-1] = 0.0
 
@@ -112,28 +146,59 @@ def build_train_episodes(
         ex_filled[-1] = 0.0
         ey_filled[-1] = 0.0
 
-        seq = np.stack([sx, sy, ex_filled, ey_filled, end_mask], axis=1).astype(np.float32)  # [T, 5]
+        dx = np.where(end_mask > 0, ex - sx, 0.0).astype(np.float32)
+        dy = np.where(end_mask > 0, ey - sy, 0.0).astype(np.float32)
+        dist = np.sqrt(dx * dx + dy * dy).astype(np.float32)
 
-        episodes.append(seq)
-        targets.append(tgt)
+        ang = np.arctan2(dy, dx).astype(np.float32)
+        angle_sin = np.where(end_mask > 0, np.sin(ang), 0.0).astype(np.float32)
+        angle_cos = np.where(end_mask > 0, np.cos(ang), 0.0).astype(np.float32)
 
-    return episodes, targets, episode_game_ids
+        t = g["time_seconds"].values.astype(np.float32)
+        dt = np.diff(t, prepend=t[0]) # type: ignore
+        dt = np.clip(dt, 0.0, None).astype(np.float32)
+        # 0~1 근처 스케일로: 대략 60초를 1 근처로
+        dt = (np.log1p(dt) / np.log1p(60.0)).astype(np.float32)
+
+        num = np.stack(
+            [sx, sy, ex_filled, ey_filled, end_mask, dx, dy, dist, angle_sin, angle_cos, dt],
+            axis=1,
+        ).astype(np.float32)  # [T, 11]
+
+        cat = np.stack(
+            [
+                map_idx(g, "player_id", vocabs["player_id"]),
+                map_idx(g, "team_id", vocabs["team_id"]),
+                map_idx(g, "type_name", vocabs["type_name"]),
+                map_idx(g, "result_name", vocabs["result_name"]),
+            ],
+            axis=1,
+        ).astype(np.int64)  # [T, 4]
+
+        episodes_num.append(num)
+        episodes_cat.append(cat)
+
+    return episodes_num, episodes_cat, targets, episode_game_ids
 
 
 def build_test_sequence_from_path(
     episode_csv_path: str,
     field_x: float,
     field_y: float,
-) -> np.ndarray:
+    vocabs: dict,
+    max_tail_k: int = 0,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    test의 개별 에피소드 csv를 읽어서
-    입력 시퀀스(액션 토큰): [sx, sy, ex_filled, ey_filled, end_mask] 생성.
-    end가 NaN이면 end_mask=0, ex/ey는 0으로 채움.
+    test의 개별 에피소드 csv -> (num_seq, cat_seq)
+
+    - end_x/end_y가 NaN이면 end_mask=0, ex/ey는 0으로 채움.
     """
     g = pd.read_csv(episode_csv_path)
-
     sort_cols = (["action_id"] if "action_id" in g.columns else []) + ["time_seconds"]
     g = g.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+
+    if max_tail_k and max_tail_k > 0:
+        g = g.tail(int(max_tail_k)).reset_index(drop=True)
 
     sx = (g["start_x"].values / field_x).astype(np.float32)  # type: ignore
     sy = (g["start_y"].values / field_y).astype(np.float32)  # type: ignore
@@ -141,76 +206,134 @@ def build_test_sequence_from_path(
     ex_raw = g["end_x"].values.astype(np.float32)  # type: ignore
     ey_raw = g["end_y"].values.astype(np.float32)  # type: ignore
 
-    # end 존재 여부
     end_ok = (~np.isnan(ex_raw)) & (~np.isnan(ey_raw))
     end_mask = end_ok.astype(np.float32)
 
-    # NaN은 0으로 채우고 정규화
-    ex_filled = np.nan_to_num(ex_raw, nan=0.0) / field_x # type: ignore
-    ey_filled = np.nan_to_num(ey_raw, nan=0.0) / field_y # type: ignore
-    ex_filled = ex_filled.astype(np.float32)
-    ey_filled = ey_filled.astype(np.float32)
+    ex = (np.nan_to_num(ex_raw, nan=0.0) / field_x).astype(np.float32) # type: ignore
+    ey = (np.nan_to_num(ey_raw, nan=0.0) / field_y).astype(np.float32) # type: ignore
 
-    seq = np.stack([sx, sy, ex_filled, ey_filled, end_mask], axis=1).astype(np.float32)  # [T, 5]
-    return seq
+    dx = np.where(end_mask > 0, ex - sx, 0.0).astype(np.float32)
+    dy = np.where(end_mask > 0, ey - sy, 0.0).astype(np.float32)
+    dist = np.sqrt(dx * dx + dy * dy).astype(np.float32)
+
+    ang = np.arctan2(dy, dx).astype(np.float32)
+    angle_sin = np.where(end_mask > 0, np.sin(ang), 0.0).astype(np.float32)
+    angle_cos = np.where(end_mask > 0, np.cos(ang), 0.0).astype(np.float32)
+
+    t = g["time_seconds"].values.astype(np.float32)
+    dt = np.diff(t, prepend=t[0]) # type: ignore
+    dt = np.clip(dt, 0.0, None).astype(np.float32)
+    dt = (np.log1p(dt) / np.log1p(60.0)).astype(np.float32)
+
+    num = np.stack(
+        [sx, sy, ex, ey, end_mask, dx, dy, dist, angle_sin, angle_cos, dt],
+        axis=1,
+    ).astype(np.float32)  # [T, 11]
+
+    def map_idx(col: str, vocab: dict) -> np.ndarray:
+        vals = g[col].fillna("None").astype(str).values
+        return np.asarray([vocab.get(v, 0) for v in vals], dtype=np.int64)
+
+    cat = np.stack(
+        [
+            map_idx("player_id", vocabs["player_id"]),
+            map_idx("team_id", vocabs["team_id"]),
+            map_idx("type_name", vocabs["type_name"]),
+            map_idx("result_name", vocabs["result_name"]),
+        ],
+        axis=1,
+    ).astype(np.int64)  # [T, 4]
+
+    return num, cat
 
 
 class EpisodeDataset(Dataset):
-    def __init__(self, episodes: List[np.ndarray], targets: List[np.ndarray]):
-        self.episodes = episodes
+    def __init__(self, episodes_num: List[np.ndarray], episodes_cat: List[np.ndarray], targets: List[np.ndarray]):
+        self.episodes_num = episodes_num
+        self.episodes_cat = episodes_cat
         self.targets = targets
 
     def __len__(self) -> int:
-        return len(self.episodes)
+        return len(self.episodes_num)
 
     def __getitem__(self, idx: int):
-        seq = torch.tensor(self.episodes[idx], dtype=torch.float32)  # [T, 5]
-        tgt = torch.tensor(self.targets[idx], dtype=torch.float32)   # [2]
-        length = seq.size(0)
-        return seq, length, tgt
-
+        num = torch.tensor(self.episodes_num[idx], dtype=torch.float32)  # [T, F]
+        cat = torch.tensor(self.episodes_cat[idx], dtype=torch.long)     # [T, 4]
+        tgt = torch.tensor(self.targets[idx], dtype=torch.float32)       # [2]
+        length = num.size(0)
+        return num, cat, length, tgt
 
 def collate_fn(batch):
-    seqs, lengths, tgts = zip(*batch)
+    nums, cats, lengths, tgts = zip(*batch)
     lengths = torch.tensor(lengths, dtype=torch.long)
-    padded = pad_sequence(seqs, batch_first=True)  # type: ignore # [B, T, 5]
-    tgts = torch.stack(tgts, dim=0)
-    return padded, lengths, tgts
+
+    padded_num = pad_sequence(nums, batch_first=True)  # type: ignore # [B, T, F]
+    padded_cat = pad_sequence(cats, batch_first=True)  # type: ignore # [B, T, 4] (padding=0)
+
+    tgts = torch.stack(tgts, dim=0)  # [B, 2]
+    return padded_num, padded_cat, lengths, tgts
 
 
 # -------------------------
 # Model
 # -------------------------
-class LSTMBaseline(nn.Module):
+class LSTMWithEmb(nn.Module):
     def __init__(
         self,
-        input_dim: int = 2,
+        numeric_dim: int,
+        vocab_sizes: dict,
+        emb_dims: dict,
         hidden_dim: int = 64,
         num_layers: int = 1,
         dropout: float = 0.0,
         bidirectional: bool = False,
+        emb_dropout: float = 0.0,
     ):
         super().__init__()
+
+        self.cat_order = ["player_id", "team_id", "type_name", "result_name"]
+
+        self.embs = nn.ModuleDict({
+            name: nn.Embedding(vocab_sizes[name], emb_dims[name], padding_idx=0)
+            for name in self.cat_order
+        })
+        self.emb_dropout = nn.Dropout(emb_dropout)
+
+        in_dim = numeric_dim + sum(emb_dims[name] for name in self.cat_order)
+
         self.lstm = nn.LSTM(
-            input_size=input_dim,
+            input_size=in_dim,
             hidden_size=hidden_dim,
             num_layers=num_layers,
             dropout=dropout if num_layers > 1 else 0.0,
             batch_first=True,
             bidirectional=bidirectional,
         )
+
         out_dim = hidden_dim * (2 if bidirectional else 1)
         self.fc = nn.Linear(out_dim, 2)
+        self.bidirectional = bidirectional
 
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        packed = pack_padded_sequence(
-            x, lengths.cpu(), batch_first=True, enforce_sorted=False
-        )
+    def forward(self, x_num: torch.Tensor, x_cat: torch.Tensor, lengths: torch.Tensor):
+        # x_num: [B,T,F], x_cat: [B,T,4]
+        emb_list = []
+        for i, name in enumerate(self.cat_order):
+            emb = self.embs[name](x_cat[:, :, i])  # [B,T,E]
+            emb_list.append(emb)
+
+        x = torch.cat([x_num] + emb_list, dim=-1)
+        x = self.emb_dropout(x)
+
+        packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
         _, (h_n, _) = self.lstm(packed)
-        # 마지막 layer의 hidden state
-        h_last = h_n[-1]
-        out = self.fc(h_last)
-        out = torch.sigmoid(out).clamp(0.0, 1.0)  # baseline과 동일하게 0~1로 클램프 fileciteturn2file0L134-L137
+
+        if self.bidirectional:
+            # 마지막 layer의 forward/backward concat
+            h_last = torch.cat([h_n[-2], h_n[-1]], dim=-1)  # [B, 2H]
+        else:
+            h_last = h_n[-1]  # [B, H]
+
+        out = torch.sigmoid(self.fc(h_last)).clamp(0.0, 1.0)
         return out
 
 
@@ -229,11 +352,11 @@ def evaluate(
     total = 0.0
     n = 0
 
-    for X, lengths, y in tqdm(loader, desc="Valid", leave=False):
-        X, lengths, y = X.to(device), lengths.to(device), y.to(device)
-        pred = model(X, lengths)
+    for X_num, X_cat, lengths, y in tqdm(loader, desc="Valid", leave=False):
+        X_num, X_cat, lengths, y = X_num.to(device), X_cat.to(device), lengths.to(device), y.to(device)
+        pred = model(X_num, X_cat, lengths)
         dist = euclidean_loss_meters(pred, y, field_x=field_x, field_y=field_y)
-        bs = X.size(0)
+        bs = X_num.size(0)
         total += float(dist.item()) * bs
         n += bs
 
@@ -260,13 +383,13 @@ def train_one_epoch(
     use_amp = bool(amp) and str(device).startswith("cuda")
     scaler = GradScaler("cuda", enabled=use_amp)
 
-    for step, (X, lengths, y) in enumerate(tqdm(loader, desc="Train", leave=False), start=1):
-        X, lengths, y = X.to(device), lengths.to(device), y.to(device)
+    for step, (X_num, X_cat, lengths, y) in enumerate(tqdm(loader, desc="Train", leave=False), start=1):
+        X_num, X_cat, lengths, y = X_num.to(device), X_cat.to(device), lengths.to(device), y.to(device)
 
         optimizer.zero_grad(set_to_none=True)
 
         with autocast("cuda", enabled=use_amp):
-            pred = model(X, lengths)
+            pred = model(X_num, X_cat, lengths)
             loss = euclidean_loss_meters(pred, y, field_x=field_x, field_y=field_y)
 
         scaler.scale(loss).backward()
@@ -278,7 +401,7 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
 
-        bs = X.size(0)
+        bs = X_num.size(0)
         total += float(loss.item()) * bs
         n += bs
 
@@ -360,27 +483,33 @@ def main(cfg: DictConfig) -> None:
     # -----------------
     # Build dataset
     # -----------------
-    episodes, targets, episode_game_ids = build_train_episodes(
-        train_path, field_x=field_x, field_y=field_y
+    vocabs, vocab_sizes = build_vocabs(train_path)
+    max_tail_k = int(cfg.data.max_tail_k) if "max_tail_k" in cfg.data else 0
+
+    episodes_num, episodes_cat, targets, episode_game_ids = build_train_episodes(
+        train_csv_path=train_path, field_x=field_x, field_y=field_y, vocabs=vocabs
         )
-    print("에피소드 수:", len(episodes))
+    print("에피소드 수:", len(episodes_num))
 
     seed = int(cfg.train.seed) if cfg.train.seed is not None else 42
     gss = GroupShuffleSplit(n_splits=1, test_size=float(cfg.train.valid_ratio), random_state=seed)
-    idx_train, idx_valid = next(gss.split(np.arange(len(episodes)), groups=episode_game_ids))
+    idx_train, idx_valid = next(gss.split(np.arange(len(episodes_num)), groups=episode_game_ids))
     train_games = set(np.array(episode_game_ids)[idx_train])
     valid_games = set(np.array(episode_game_ids)[idx_valid])
     print("overlap games:", len(train_games & valid_games))  # 반드시 0이어야 함
     print("train games:", len(train_games), "valid games:", len(valid_games))
 
-    episodes_train = [episodes[i] for i in idx_train]
+    episodes_num_train = [episodes_num[i] for i in idx_train]
+    episodes_cat_train = [episodes_cat[i] for i in idx_train]
     targets_train = [targets[i] for i in idx_train]
-    episodes_valid = [episodes[i] for i in idx_valid]
+
+    episodes_num_valid = [episodes_num[i] for i in idx_valid]
+    episodes_cat_valid = [episodes_cat[i] for i in idx_valid]
     targets_valid = [targets[i] for i in idx_valid]
-    print("train episodes:", len(episodes_train), "valid episodes:", len(episodes_valid))
+    print("train episodes:", len(episodes_num_train), "valid episodes:", len(episodes_num_valid))
 
     train_loader = DataLoader(
-        EpisodeDataset(episodes_train, targets_train),
+        EpisodeDataset(episodes_num_train, episodes_cat_train, targets_train),
         batch_size=int(cfg.train.batch_size),
         shuffle=True,
         collate_fn=collate_fn,
@@ -388,7 +517,7 @@ def main(cfg: DictConfig) -> None:
         pin_memory=bool(cfg.train.pin_memory),
     )
     valid_loader = DataLoader(
-        EpisodeDataset(episodes_valid, targets_valid),
+        EpisodeDataset(episodes_num_valid, episodes_cat_valid, targets_valid),
         batch_size=int(cfg.train.batch_size),
         shuffle=False,
         collate_fn=collate_fn,
@@ -399,12 +528,22 @@ def main(cfg: DictConfig) -> None:
     # -----------------
     # Model / Optim
     # -----------------
-    model = LSTMBaseline(
-        input_dim=int(cfg.model.input_dim),
+    numeric_dim = int(episodes_num_train[0].shape[1])  # 11
+    # emb_dims는 config(model.emb_dims)에서 가져오고, 없으면 기본값 사용
+    if "emb_dims" in cfg.model and cfg.model.emb_dims is not None:
+        emb_dims = OmegaConf.to_container(cfg.model.emb_dims, resolve=True)  # type: ignore
+    else:
+        emb_dims = {"player_id": 16, "team_id": 8, "type_name": 8, "result_name": 4}
+
+    model = LSTMWithEmb(
+        numeric_dim=numeric_dim,
+        vocab_sizes=vocab_sizes,
+        emb_dims=emb_dims, # type: ignore
         hidden_dim=int(cfg.model.hidden_dim),
         num_layers=int(cfg.model.num_layers),
         dropout=float(cfg.model.dropout),
         bidirectional=bool(cfg.model.bidirectional),
+        emb_dropout=float(cfg.model.get("emb_dropout", 0.0)),
     ).to(device)
 
     optimizer = torch.optim.Adam(
@@ -509,13 +648,16 @@ def main(cfg: DictConfig) -> None:
 
     for _, row in tqdm(submission.iterrows(), total=len(submission), desc="Inference"):
         episode_path = to_absolute_path(str(row["path"]))  # test.csv의 path 컬럼
-        seq = build_test_sequence_from_path(episode_path, field_x=field_x, field_y=field_y)
+        num, cat = build_test_sequence_from_path(
+            episode_path, field_x=field_x, field_y=field_y, vocabs=vocabs, max_tail_k=max_tail_k
+        )
 
-        x = torch.tensor(seq).unsqueeze(0).to(device)  # [1, T, 2] fileciteturn2file0L229-L230
-        length = torch.tensor([seq.shape[0]]).to(device)
+        x_num = torch.tensor(num, dtype=torch.float32).unsqueeze(0).to(device)  # [1, T, F]
+        x_cat = torch.tensor(cat, dtype=torch.long).unsqueeze(0).to(device)     # [1, T, 4]
+        length = torch.tensor([num.shape[0]]).to(device)
 
         with torch.no_grad():
-            pred = model(x, length).detach().cpu().numpy()[0]  # [2] fileciteturn2file0L232-L234
+            pred = model(x_num, x_cat, length).detach().cpu().numpy()[0]  # [2]
 
         preds_x.append(float(pred[0] * field_x))
         preds_y.append(float(pred[1] * field_y))

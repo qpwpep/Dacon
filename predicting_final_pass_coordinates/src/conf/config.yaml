@@ -2,7 +2,6 @@
 defaults:
   - _self_
 
-# 어떤 작업을 할지 (필요하면 확장해서 train만 / predict만도 가능)
 task: train_and_predict
 
 data:
@@ -11,34 +10,43 @@ data:
   sample_submission_path: data/sample_submission.csv
   field_x: 105.0
   field_y: 68.0
+  # 0이면 전체 시퀀스 사용, 예: 64면 마지막 64개 action만 사용(노이즈 줄이기에 유리)
+  max_tail_k: 0
 
 model:
-  input_dim: 5
-  hidden_dim: 64
+  # numeric feature dim은 코드에서 자동 추론(현재 기본 11)
+  hidden_dim: 128
   num_layers: 1
-  dropout: 0.0
+  dropout: 0.1
   bidirectional: false
+  # categorical embedding dims
+  emb_dims:
+    player_id: 16
+    team_id: 8
+    type_name: 8
+    result_name: 4
+  emb_dropout: 0.1
 
 train:
+  seed: 42
+  device: auto            # auto | cpu | cuda
   batch_size: 64
-  epochs: 5
+  epochs: 20
+  valid_ratio: 0.2
   lr: 1e-3
   weight_decay: 0.0
-  valid_ratio: 0.2
-  seed: 42
-  num_workers: 0
+  grad_clip: 1.0
+  amp: true
+  num_workers: 2
   pin_memory: true
-  grad_clip: 0.0        # 0이면 미사용
-  amp: false            # mixed precision
   log_every_steps: 50
-  device: auto          # auto | cpu | cuda
 
 output:
   ckpt_name: best.ckpt.pt
   submission_name: baseline_submit.csv
 
 wandb:
-  enabled: true
+  enabled: false
   project: episode-lstm
   entity: null
   name: null
