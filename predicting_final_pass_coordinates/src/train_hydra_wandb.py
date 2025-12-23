@@ -80,7 +80,8 @@ def build_train_episodes(
     """
     df = pd.read_csv(train_csv_path)
     # baseline에서처럼 episode/time 정렬 (시퀀스 순서를 보장) fileciteturn2file0L26-L27
-    df = df.sort_values(["game_episode", "time_seconds"]).reset_index(drop=True)
+    sort_cols = ["game_episode", "time_seconds"] + (["action_id"] if "action_id" in df.columns else [])
+    df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
 
     episodes: List[np.ndarray] = []
     targets: List[np.ndarray] = []
@@ -122,7 +123,9 @@ def build_test_sequence_from_path(
     test에서는 마지막 row의 end_x/end_y가 NaN인 경우가 많아 baseline은
     마지막 row 이전까지만 end를 넣는 방식으로 처리함 fileciteturn2file0L223-L225
     """
-    g = pd.read_csv(episode_csv_path).reset_index(drop=True)
+    g = pd.read_csv(episode_csv_path)
+    sort_cols = ["time_seconds"] + (["action_id"] if "action_id" in g.columns else [])
+    g = g.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
 
     sx = (g["start_x"].values / field_x).astype(np.float32) # type: ignore
     sy = (g["start_y"].values / field_y).astype(np.float32) # type: ignore
