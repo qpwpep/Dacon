@@ -73,14 +73,15 @@ def build_train_episodes(
 ) -> Tuple[List[np.ndarray], List[np.ndarray], List[int]]:
     """
     train.csv를 읽어서
-      - 입력 시퀀스: start(x,y), end(x,y), start(x,y), end(x,y), ...
-        (단, 마지막 row의 end는 타깃으로 쓰기 때문에 입력에 포함하지 않음)
-      - 타깃: 마지막 row의 end_x, end_y (정규화)
-    를 에피소드 단위로 만들어 리스트로 반환.
+      - 입력 시퀀스(액션 토큰): [sx, sy, ex_filled, ey_filled, end_mask]  (정규화)
+        * 마지막 row는 test와 동일하게 end를 비운 상태로 입력 (end_mask=0, ex/ey=0)
+      - 타깃: 마지막 row의 (end_x, end_y) (정규화)
+    를 에피소드 단위로 생성.
     """
     df = pd.read_csv(train_csv_path)
-    # baseline에서처럼 episode/time 정렬 (시퀀스 순서를 보장) fileciteturn2file0L26-L27
-    sort_cols = ["game_episode", "time_seconds"] + (["action_id"] if "action_id" in df.columns else [])
+
+    # 순서 안정성을 위해 action_id 우선(있다면) + time_seconds
+    sort_cols = ["game_episode"] + (["action_id"] if "action_id" in df.columns else []) + ["time_seconds"]
     df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
 
     episodes: List[np.ndarray] = []
@@ -88,24 +89,30 @@ def build_train_episodes(
     episode_game_ids: List[int] = []
 
     for game_episode, g in tqdm(df.groupby("game_episode"), desc="Build episodes (train)"):
-        # game_id 파싱 (game_episode = "{game_id}_{episode_id}")
         game_id = int(str(game_episode).split("_", 1)[0])
         episode_game_ids.append(game_id)
 
-        # 정규화된 좌표 준비 fileciteturn2file0L37-L41
-        sx = (g["start_x"].values / field_x).astype(np.float32) # type: ignore
-        sy = (g["start_y"].values / field_y).astype(np.float32) # type: ignore
-        ex = (g["end_x"].values / field_x).astype(np.float32) # type: ignore
-        ey = (g["end_y"].values / field_y).astype(np.float32) # type: ignore
+        sx = (g["start_x"].values / field_x).astype(np.float32)  # type: ignore
+        sy = (g["start_y"].values / field_y).astype(np.float32)  # type: ignore
+        ex = (g["end_x"].values / field_x).astype(np.float32)    # type: ignore
+        ey = (g["end_y"].values / field_y).astype(np.float32)    # type: ignore
 
-        coords: List[List[float]] = []
-        for i in range(len(g)):
-            coords.append([float(sx[i]), float(sy[i])])  # start는 항상 포함 fileciteturn2file0L45-L46
-            if i < len(g) - 1:
-                coords.append([float(ex[i]), float(ey[i])])  # 마지막 end는 입력 제외 fileciteturn2file0L47-L49
-
-        seq = np.asarray(coords, dtype=np.float32)  # [T, 2] fileciteturn2file0L51-L52
+        # 타깃(마지막 row의 진짜 end)
         tgt = np.asarray([float(ex[-1]), float(ey[-1])], dtype=np.float32)
+
+        T = len(g)
+
+        # 입력은 test 조건과 동일하게 만들기 위해:
+        # - 마지막 row의 end는 "없는 것"으로 처리(end_mask=0, ex/ey=0)
+        end_mask = np.ones((T,), dtype=np.float32)
+        end_mask[-1] = 0.0
+
+        ex_filled = ex.copy()
+        ey_filled = ey.copy()
+        ex_filled[-1] = 0.0
+        ey_filled[-1] = 0.0
+
+        seq = np.stack([sx, sy, ex_filled, ey_filled, end_mask], axis=1).astype(np.float32)  # [T, 5]
 
         episodes.append(seq)
         targets.append(tgt)
@@ -119,29 +126,33 @@ def build_test_sequence_from_path(
     field_y: float,
 ) -> np.ndarray:
     """
-    test의 개별 에피소드 csv를 읽어서 입력 시퀀스를 생성.
-    test에서는 마지막 row의 end_x/end_y가 NaN인 경우가 많아 baseline은
-    마지막 row 이전까지만 end를 넣는 방식으로 처리함 fileciteturn2file0L223-L225
+    test의 개별 에피소드 csv를 읽어서
+    입력 시퀀스(액션 토큰): [sx, sy, ex_filled, ey_filled, end_mask] 생성.
+    end가 NaN이면 end_mask=0, ex/ey는 0으로 채움.
     """
     g = pd.read_csv(episode_csv_path)
-    sort_cols = ["time_seconds"] + (["action_id"] if "action_id" in g.columns else [])
+
+    sort_cols = (["action_id"] if "action_id" in g.columns else []) + ["time_seconds"]
     g = g.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
 
-    sx = (g["start_x"].values / field_x).astype(np.float32) # type: ignore
-    sy = (g["start_y"].values / field_y).astype(np.float32) # type: ignore
+    sx = (g["start_x"].values / field_x).astype(np.float32)  # type: ignore
+    sy = (g["start_y"].values / field_y).astype(np.float32)  # type: ignore
 
-    # end는 마지막 row를 제외하고만 사용 (마지막이 NaN인 케이스 대비) fileciteturn2file0L223-L225
-    ex = (g["end_x"].values / field_x).astype(np.float32) # type: ignore
-    ey = (g["end_y"].values / field_y).astype(np.float32) # type: ignore
+    ex_raw = g["end_x"].values.astype(np.float32)  # type: ignore
+    ey_raw = g["end_y"].values.astype(np.float32)  # type: ignore
 
-    coords: List[List[float]] = []
-    n = len(g)
-    for i in range(n):
-        coords.append([float(sx[i]), float(sy[i])])
-        if i < n - 1:
-            coords.append([float(ex[i]), float(ey[i])])
+    # end 존재 여부
+    end_ok = (~np.isnan(ex_raw)) & (~np.isnan(ey_raw))
+    end_mask = end_ok.astype(np.float32)
 
-    return np.asarray(coords, dtype=np.float32)
+    # NaN은 0으로 채우고 정규화
+    ex_filled = np.nan_to_num(ex_raw, nan=0.0) / field_x # type: ignore
+    ey_filled = np.nan_to_num(ey_raw, nan=0.0) / field_y # type: ignore
+    ex_filled = ex_filled.astype(np.float32)
+    ey_filled = ey_filled.astype(np.float32)
+
+    seq = np.stack([sx, sy, ex_filled, ey_filled, end_mask], axis=1).astype(np.float32)  # [T, 5]
+    return seq
 
 
 class EpisodeDataset(Dataset):
@@ -153,8 +164,8 @@ class EpisodeDataset(Dataset):
         return len(self.episodes)
 
     def __getitem__(self, idx: int):
-        seq = torch.tensor(self.episodes[idx])  # [T, 2] fileciteturn2file0L68-L72
-        tgt = torch.tensor(self.targets[idx])   # [2]
+        seq = torch.tensor(self.episodes[idx], dtype=torch.float32)  # [T, 5]
+        tgt = torch.tensor(self.targets[idx], dtype=torch.float32)   # [2]
         length = seq.size(0)
         return seq, length, tgt
 
@@ -162,7 +173,7 @@ class EpisodeDataset(Dataset):
 def collate_fn(batch):
     seqs, lengths, tgts = zip(*batch)
     lengths = torch.tensor(lengths, dtype=torch.long)
-    padded = pad_sequence(seqs, batch_first=True)  # type: ignore # [B, T, 2] fileciteturn2file0L74-L79
+    padded = pad_sequence(seqs, batch_first=True)  # type: ignore # [B, T, 5]
     tgts = torch.stack(tgts, dim=0)
     return padded, lengths, tgts
 
