@@ -129,12 +129,23 @@ def build_train_episodes(
         game_id = int(str(game_episode).split("_", 1)[0])
         episode_game_ids.append(game_id)
 
-        sx = (g["start_x"].values / field_x).astype(np.float32)  # type: ignore
-        sy = (g["start_y"].values / field_y).astype(np.float32)  # type: ignore
-        ex = (g["end_x"].values / field_x).astype(np.float32)    # type: ignore
-        ey = (g["end_y"].values / field_y).astype(np.float32)    # type: ignore
+        # --- absolute normalized coords (0~1) ---
+        sx_abs = (g["start_x"].values / field_x).astype(np.float32)  # type: ignore
+        sy_abs = (g["start_y"].values / field_y).astype(np.float32)  # type: ignore
+        ex_abs = (g["end_x"].values / field_x).astype(np.float32)    # type: ignore
+        ey_abs = (g["end_y"].values / field_y).astype(np.float32)    # type: ignore
 
-        # 타깃: 마지막 row의 진짜 end
+        # Anchor = 마지막 action(=예측 대상 Pass)의 start 좌표 (정규화)
+        anchor_x = float(sx_abs[-1])
+        anchor_y = float(sy_abs[-1])
+
+        # --- anchor-relative coords (delta coordinate frame) ---
+        sx = (sx_abs - anchor_x).astype(np.float32)
+        sy = (sy_abs - anchor_y).astype(np.float32)
+        ex = (ex_abs - anchor_x).astype(np.float32)
+        ey = (ey_abs - anchor_y).astype(np.float32)
+
+        # 타깃: 마지막 row의 end를 anchor 기준 델타로 예측
         tgt = np.asarray([float(ex[-1]), float(ey[-1])], dtype=np.float32)
         targets.append(tgt)
 
@@ -146,6 +157,7 @@ def build_train_episodes(
 
         ex_filled = ex.copy()
         ey_filled = ey.copy()
+        # 마지막 row는 end가 없다고 가정 -> (start와 동일) => 상대좌표계에선 (0,0)
         ex_filled[-1] = 0.0
         ey_filled[-1] = 0.0
 
@@ -165,8 +177,12 @@ def build_train_episodes(
         # 0~1 근처 스케일로: 대략 60초를 1 근처로
         dt = (np.log1p(dt) / np.log1p(60.0)).astype(np.float32)
 
+        # anchor absolute position (normalized) as additional numeric features
+        anchor_x_feat = np.full((T,), anchor_x, dtype=np.float32)
+        anchor_y_feat = np.full((T,), anchor_y, dtype=np.float32)
+
         num = np.stack(
-            [sx, sy, ex_filled, ey_filled, end_mask, dx, dy, dist, angle_sin, angle_cos, dt],
+            [sx, sy, ex_filled, ey_filled, end_mask, dx, dy, dist, angle_sin, angle_cos, dt, anchor_x_feat, anchor_y_feat],
             axis=1,
         ).astype(np.float32)  # [T, 11]
 
@@ -192,11 +208,11 @@ def build_test_sequence_from_path(
     field_y: float,
     vocabs: dict,
     max_tail_k: int = 0,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     test의 개별 에피소드 csv -> (num_seq, cat_seq)
 
-    - end_x/end_y가 NaN이면 end_mask=0, ex/ey는 0으로 채움.
+    - end_x/end_y가 NaN이면 end_mask=0, ex/ey는 start로 채움(상대좌표계에선 0).
     """
     g = pd.read_csv(episode_csv_path)
     sort_cols = (["action_id"] if "action_id" in g.columns else []) + ["time_seconds"]
@@ -205,8 +221,9 @@ def build_test_sequence_from_path(
     if max_tail_k and max_tail_k > 0:
         g = g.tail(int(max_tail_k)).reset_index(drop=True)
 
-    sx = (g["start_x"].values / field_x).astype(np.float32)  # type: ignore
-    sy = (g["start_y"].values / field_y).astype(np.float32)  # type: ignore
+    # --- absolute normalized coords (0~1) ---
+    sx_abs = (g["start_x"].values / field_x).astype(np.float32)  # type: ignore
+    sy_abs = (g["start_y"].values / field_y).astype(np.float32)  # type: ignore
 
     ex_raw = g["end_x"].values.astype(np.float32)  # type: ignore
     ey_raw = g["end_y"].values.astype(np.float32)  # type: ignore
@@ -214,8 +231,20 @@ def build_test_sequence_from_path(
     end_ok = (~np.isnan(ex_raw)) & (~np.isnan(ey_raw))
     end_mask = end_ok.astype(np.float32)
 
-    ex = (np.nan_to_num(ex_raw, nan=0.0) / field_x).astype(np.float32) # type: ignore
-    ey = (np.nan_to_num(ey_raw, nan=0.0) / field_y).astype(np.float32) # type: ignore
+    ex_abs = (np.nan_to_num(ex_raw, nan=0.0) / field_x).astype(np.float32) # type: ignore
+    ey_abs = (np.nan_to_num(ey_raw, nan=0.0) / field_y).astype(np.float32) # type: ignore
+    ex_abs = np.where(end_mask > 0, ex_abs, sx_abs)
+    ey_abs = np.where(end_mask > 0, ey_abs, sy_abs)
+
+    # Anchor = 마지막 action의 start(정규화)
+    anchor_x = float(sx_abs[-1])
+    anchor_y = float(sy_abs[-1])
+
+    # --- anchor-relative coords ---
+    sx = (sx_abs - anchor_x).astype(np.float32)
+    sy = (sy_abs - anchor_y).astype(np.float32)
+    ex = (ex_abs - anchor_x).astype(np.float32)
+    ey = (ey_abs - anchor_y).astype(np.float32)
 
     dx = np.where(end_mask > 0, ex - sx, 0.0).astype(np.float32)
     dy = np.where(end_mask > 0, ey - sy, 0.0).astype(np.float32)
@@ -232,10 +261,15 @@ def build_test_sequence_from_path(
     dt = np.clip(dt, 0.0, None).astype(np.float32)
     dt = (np.log1p(dt) / np.log1p(60.0)).astype(np.float32)
 
+    T = len(g)
+    # anchor absolute position (normalized) as additional numeric features
+    anchor_x_feat = np.full((T,), anchor_x, dtype=np.float32)
+    anchor_y_feat = np.full((T,), anchor_y, dtype=np.float32)
+
     num = np.stack(
-        [sx, sy, ex, ey, end_mask, dx, dy, dist, angle_sin, angle_cos, dt],
+        [sx, sy, ex, ey, end_mask, dx, dy, dist, angle_sin, angle_cos, dt, anchor_x_feat, anchor_y_feat],
         axis=1,
-    ).astype(np.float32)  # [T, 11]
+    ).astype(np.float32)  # [T, 13]
 
     def map_idx(col: str, vocab: dict) -> np.ndarray:
         vals = g[col].fillna("None").astype(str).values
@@ -251,7 +285,8 @@ def build_test_sequence_from_path(
         axis=1,
     ).astype(np.int64)  # [T, 4]
 
-    return num, cat
+    anchor = np.asarray([anchor_x, anchor_y], dtype=np.float32)
+    return num, cat, anchor
 
 
 class EpisodeDataset(Dataset):
@@ -340,7 +375,7 @@ class LSTMWithEmb(nn.Module):
         else:
             h_last = h_n[-1]  # [B, H]
 
-        out = torch.sigmoid(self.fc(h_last)).clamp(0.0, 1.0)
+        out = torch.tanh(self.fc(h_last))  # [-1, 1] delta in normalized coord
         return out
 
 
@@ -655,7 +690,7 @@ def main(cfg: DictConfig) -> None:
 
     for _, row in tqdm(submission.iterrows(), total=len(submission), desc="Inference"):
         episode_path = to_absolute_path(str(row["path"]))  # test.csv의 path 컬럼
-        num, cat = build_test_sequence_from_path(
+        num, cat, anchor = build_test_sequence_from_path(
             episode_path, field_x=field_x, field_y=field_y, vocabs=vocabs, max_tail_k=max_tail_k
         )
 
@@ -666,8 +701,12 @@ def main(cfg: DictConfig) -> None:
         with torch.no_grad():
             pred = model(x_num, x_cat, length).detach().cpu().numpy()[0]  # [2]
 
-        preds_x.append(float(pred[0] * field_x))
-        preds_y.append(float(pred[1] * field_y))
+        # pred is delta in normalized coords (anchor-relative)
+        end_norm = pred + anchor  # absolute normalized end position
+        end_norm = np.clip(end_norm, 0.0, 1.0)
+
+        preds_x.append(float(end_norm[0] * field_x))
+        preds_y.append(float(end_norm[1] * field_y))
 
     submission["end_x"] = preds_x
     submission["end_y"] = preds_y

@@ -14,7 +14,7 @@ data:
   max_tail_k: 0
 
 model:
-  # numeric feature dim은 코드에서 자동 추론(현재 기본 11)
+  # numeric feature dim은 코드에서 자동 추론(현재 기본 13)
   hidden_dim: 128
   num_layers: 1
   dropout: 0.1
@@ -46,7 +46,7 @@ output:
   submission_name: baseline_submit.csv
 
 wandb:
-  enabled: false
+  enabled: true
   project: episode-lstm
   entity: null
   name: null
