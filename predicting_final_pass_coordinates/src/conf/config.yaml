@@ -1,0 +1,53 @@
+# conf/config.yaml
+defaults:
+  - _self_
+
+# 어떤 작업을 할지 (필요하면 확장해서 train만 / predict만도 가능)
+task: train_and_predict
+
+data:
+  train_path: data/train.csv
+  test_meta_path: data/test.csv
+  sample_submission_path: data/sample_submission.csv
+  field_x: 105.0
+  field_y: 68.0
+
+model:
+  input_dim: 2
+  hidden_dim: 64
+  num_layers: 1
+  dropout: 0.0
+  bidirectional: false
+
+train:
+  batch_size: 64
+  epochs: 5
+  lr: 1e-3
+  weight_decay: 0.0
+  valid_ratio: 0.2
+  seed: 42
+  num_workers: 0
+  pin_memory: true
+  grad_clip: 0.0        # 0이면 미사용
+  amp: false            # mixed precision
+  log_every_steps: 50
+  device: auto          # auto | cpu | cuda
+
+output:
+  ckpt_name: best.ckpt.pt
+  submission_name: baseline_submit.csv
+
+wandb:
+  enabled: true
+  project: episode-lstm
+  entity: null
+  name: null
+  tags: []
+  notes: null
+  mode: online          # online | offline | disabled
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true

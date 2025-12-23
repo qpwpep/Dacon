@@ -132,6 +132,8 @@ class LSTMBaseline(nn.Module):
         _, (h_n, _) = self.lstm(packed)
         h_last = h_n[-1]      # [B, H] 마지막 layer의 hidden state
         out = self.fc(h_last) # [B, 2]
+        out = torch.sigmoid(out)
+        out = out.clamp(0.0, 1.0)
         return out
 
 model = LSTMBaseline(input_dim=2, hidden_dim=HIDDEN_DIM).to(DEVICE)
