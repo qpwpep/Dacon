@@ -80,9 +80,9 @@ def unify_frame_to_ref_team(
 
     # NaN이 있어도 field_x - NaN = NaN 이라 안전
     for col in ["start_x", "end_x"]:
-        g.loc[opp, col] = field_x - g.loc[opp, col].astype(float)
+        g.loc[opp, col] = field_x - g.loc[opp, col].astype(float) # type: ignore
     for col in ["start_y", "end_y"]:
-        g.loc[opp, col] = field_y - g.loc[opp, col].astype(float)
+        g.loc[opp, col] = field_y - g.loc[opp, col].astype(float) # type: ignore
 
     return g
 
@@ -195,11 +195,17 @@ def build_train_episodes(
 
         dx = np.where(end_mask > 0, ex_rel - sx_rel, 0.0).astype(np.float32)
         dy = np.where(end_mask > 0, ey_rel - sy_rel, 0.0).astype(np.float32)
-        dist = np.sqrt(dx * dx + dy * dy).astype(np.float32)
+        dx_m = (dx * field_x).astype(np.float32)
+        dy_m = (dy * field_y).astype(np.float32)
+        dist_m = np.sqrt(dx_m * dx_m + dy_m * dy_m).astype(np.float32)
+        # dist는 입력 스케일 안정화를 위해 0~1 근처로 스케일(대각선 길이로 나눔)
+        diag = float(np.sqrt(field_x * field_x + field_y * field_y))
+        dist = (dist_m / diag).astype(np.float32)
 
-        ang = np.arctan2(dy, dx).astype(np.float32)
-        eps = 1e-6
-        valid_dir = (end_mask > 0) & (dist > eps)
+        # 방향 유효성은 dist_m 기준이 더 자연스러움
+        ang = np.arctan2(dy_m, dx_m).astype(np.float32)
+        eps_m = 1e-3
+        valid_dir = (end_mask > 0) & (dist_m > eps_m)
         angle_sin = np.where(valid_dir, np.sin(ang), 0.0).astype(np.float32)
         angle_cos = np.where(valid_dir, np.cos(ang), 0.0).astype(np.float32)
 
@@ -308,11 +314,15 @@ def build_test_sequence_from_path(
 
     dx = np.where(end_mask > 0, ex_rel - sx_rel, 0.0).astype(np.float32)
     dy = np.where(end_mask > 0, ey_rel - sy_rel, 0.0).astype(np.float32)
-    dist = np.sqrt(dx * dx + dy * dy).astype(np.float32)
+    dx_m = (dx * field_x).astype(np.float32)
+    dy_m = (dy * field_y).astype(np.float32)
+    dist_m = np.sqrt(dx_m * dx_m + dy_m * dy_m).astype(np.float32)
+    diag = float(np.sqrt(field_x * field_x + field_y * field_y))
+    dist = (dist_m / diag).astype(np.float32)
 
-    ang = np.arctan2(dy, dx).astype(np.float32)
-    eps = 1e-6
-    valid_dir = (end_mask > 0) & (dist > eps)
+    ang = np.arctan2(dy_m, dx_m).astype(np.float32)
+    eps_m = 1e-3
+    valid_dir = (end_mask > 0) & (dist_m > eps_m)
     angle_sin = np.where(valid_dir, np.sin(ang), 0.0).astype(np.float32)
     angle_cos = np.where(valid_dir, np.cos(ang), 0.0).astype(np.float32)
 
