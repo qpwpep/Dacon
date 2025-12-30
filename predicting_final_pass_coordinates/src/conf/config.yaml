@@ -16,7 +16,7 @@ data:
 model:
   # numeric feature dim은 코드에서 자동 추론(현재 기본 13)
   hidden_dim: 128
-  num_layers: 1
+  num_layers: 2
   dropout: 0.1
   bidirectional: false
   # categorical embedding dims

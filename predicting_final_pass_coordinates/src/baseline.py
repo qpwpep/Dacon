@@ -63,6 +63,30 @@ def euclidean_loss_meters(
     return dist.mean()
 
 
+def unify_frame_to_ref_team(
+    g: pd.DataFrame,
+    ref_team_id: int,
+    field_x: float = 105.0,
+    field_y: float = 68.0,
+    team_col: str = "team_id",
+) -> pd.DataFrame:
+    """
+    ref_team_id 관점으로 좌표 프레임 통일:
+    상대팀 액션의 (start_x,start_y,end_x,end_y)를 180도 회전한다.
+    x' = field_x - x, y' = field_y - y
+    """
+    g = g.copy()
+    opp = (g[team_col].values != ref_team_id)
+
+    # NaN이 있어도 field_x - NaN = NaN 이라 안전
+    for col in ["start_x", "end_x"]:
+        g.loc[opp, col] = field_x - g.loc[opp, col].astype(float)
+    for col in ["start_y", "end_y"]:
+        g.loc[opp, col] = field_y - g.loc[opp, col].astype(float)
+
+    return g
+
+
 # -------------------------
 # Data
 # -------------------------
@@ -129,6 +153,8 @@ def build_train_episodes(
         game_id = int(str(game_episode).split("_", 1)[0])
         episode_game_ids.append(game_id)
 
+        ref_team = int(g["team_id"].iloc[-1])
+        g = unify_frame_to_ref_team(g, ref_team_id=ref_team, field_x=field_x, field_y=field_y)
                 # --- absolute normalized coords (0~1) ---
         sx_abs = (g["start_x"].values / field_x).astype(np.float32)  # type: ignore
         sy_abs = (g["start_y"].values / field_y).astype(np.float32)  # type: ignore
@@ -244,6 +270,8 @@ def build_test_sequence_from_path(
     if max_tail_k and max_tail_k > 0:
         g = g.tail(int(max_tail_k)).reset_index(drop=True)
 
+    ref_team = int(g["team_id"].iloc[-1])
+    g = unify_frame_to_ref_team(g, ref_team_id=ref_team, field_x=field_x, field_y=field_y)
         # --- absolute normalized coords (0~1) ---
     sx_abs = (g["start_x"].values / field_x).astype(np.float32)  # type: ignore
     sy_abs = (g["start_y"].values / field_y).astype(np.float32)  # type: ignore
