@@ -27,6 +27,21 @@ from omegaconf import DictConfig, OmegaConf
 # -------------------------
 # Utils
 # -------------------------
+NO_END_TYPES = {
+    "Aerial Clearance",
+    "Block",
+    "Deflection",
+    "Error",
+    "Foul",
+    "Handball_Foul",
+    "Hit",
+    "Intervention",
+    "Parry",
+    "Take-On",
+    "Catch"
+}
+
+
 def set_seed(seed: int) -> None:
     import random
 
@@ -140,121 +155,151 @@ def build_train_episodes(
     episodes_num: List[np.ndarray] = []
     episodes_cat: List[np.ndarray] = []
     targets: List[np.ndarray] = []
-    episode_game_ids: List[int] = []
+    sample_game_ids: List[int] = []
 
     def map_idx(g: pd.DataFrame, col: str, vocab: dict) -> np.ndarray:
         vals = g[col].fillna("None").astype(str).values
         return np.asarray([vocab.get(v, 1) for v in vals], dtype=np.int64)  # default UNK=1
 
-    for game_episode, g in tqdm(df.groupby("game_episode"), desc="Build episodes (train)"):
+    for game_episode, g in tqdm(df.groupby("game_episode"), desc="Build samples (train: all Pass)"):
         if max_tail_k and max_tail_k > 0:
             g = g.tail(int(max_tail_k)).reset_index(drop=True)
 
+        # 타깃 후보: Pass 계열(문자열 prefix가 "Pass")
+        type_vals = g["type_name"].fillna("None").astype(str).values
+        # pass_indices = np.where(np.char.startswith(type_vals.astype(str), "Pass"))[0] # type: ignore
+        pass_indices = np.where(type_vals.astype(str) == "Pass")[0] # pass만 쓰려면 이거 활성화
+        if len(pass_indices) == 0:
+            continue
+
         game_id = int(str(game_episode).split("_", 1)[0])
-        episode_game_ids.append(game_id)
 
-        ref_team = int(g["team_id"].iloc[-1])
-        g = unify_frame_to_ref_team(g, ref_team_id=ref_team, field_x=field_x, field_y=field_y)
-                # --- absolute normalized coords (0~1) ---
-        sx_abs = (g["start_x"].values / field_x).astype(np.float32)  # type: ignore
-        sy_abs = (g["start_y"].values / field_y).astype(np.float32)  # type: ignore
-        ex_abs = (g["end_x"].values / field_x).astype(np.float32)    # type: ignore
-        ey_abs = (g["end_y"].values / field_y).astype(np.float32)    # type: ignore
+        # 같은 episode 안에서는 ref_team이 최대 2개뿐이라, team별 unify 결과를 캐시해서 재사용
+        team_vals = g["team_id"].astype(int).values
+        uniq_teams = list(dict.fromkeys(team_vals.tolist()))  # stable unique
+        unified_cache: dict[int, pd.DataFrame] = {}
+        for t_id in uniq_teams:
+            unified_cache[int(t_id)] = unify_frame_to_ref_team(
+                g, ref_team_id=int(t_id), field_x=field_x, field_y=field_y
+            )
 
-        # Anchor = 마지막 action(=예측 대상 Pass)의 start 좌표 (정규화)
-        anchor_x = float(sx_abs[-1])
-        anchor_y = float(sy_abs[-1])
+        for t_idx in pass_indices:
+            ref_team = int(team_vals[t_idx])
+            g_ref = unified_cache[ref_team].iloc[: t_idx + 1].reset_index(drop=True)
 
-        # --- anchor-relative coords (delta coordinate frame) ---
-        sx_rel = (sx_abs - anchor_x).astype(np.float32)
-        sy_rel = (sy_abs - anchor_y).astype(np.float32)
-        ex_rel = (ex_abs - anchor_x).astype(np.float32)
-        ey_rel = (ey_abs - anchor_y).astype(np.float32)
+            # --- absolute normalized coords (0~1) ---
+            sx_abs = (g_ref["start_x"].values / field_x).astype(np.float32)  # type: ignore
+            sy_abs = (g_ref["start_y"].values / field_y).astype(np.float32)  # type: ignore
 
-        # 타깃: 마지막 row의 end를 anchor 기준 델타로 예측
-        tgt = np.asarray([float(ex_rel[-1]), float(ey_rel[-1])], dtype=np.float32)
-        targets.append(tgt)
+            # raw end (may be NaN)
+            ex_raw = g_ref["end_x"].values.astype(np.float32)  # type: ignore
+            ey_raw = g_ref["end_y"].values.astype(np.float32)  # type: ignore
 
-        T = len(g)
+            # anchor는 "타깃 Pass의 start"
+            anchor_x = float(sx_abs[-1])
+            anchor_y = float(sy_abs[-1])
 
-        # 입력은 test와 동일하게: 마지막 end는 비워둠
-        end_mask = np.ones((T,), dtype=np.float32)
-        end_mask[-1] = 0.0
+            # 타깃: 마지막 row(=t_idx Pass)의 "실제 end"를 anchor 기준 델타로 예측
+            # (입력에서 end를 가리더라도 y는 실제 end를 써야 함)
+            if np.isnan(ex_raw[-1]) or np.isnan(ey_raw[-1]):
+                # 드물지만 end가 없으면 학습 불가 -> 스킵
+                continue
+            tgt = np.asarray(
+                [float(ex_raw[-1] / field_x) - anchor_x, float(ey_raw[-1] / field_y) - anchor_y],
+                dtype=np.float32,
+            )
+            targets.append(tgt)
+            sample_game_ids.append(game_id)
 
-        # absolute end filled: last row는 end가 없다고 가정 -> start로 채움
-        ex_abs_filled = ex_abs.copy()
-        ey_abs_filled = ey_abs.copy()
-        ex_abs_filled[-1] = sx_abs[-1]
-        ey_abs_filled[-1] = sy_abs[-1]
+            T = len(g_ref)
 
-        # relative end filled: last row는 (0,0)으로
-        ex_rel_filled = ex_rel.copy()
-        ey_rel_filled = ey_rel.copy()
-        ex_rel_filled[-1] = 0.0
-        ey_rel_filled[-1] = 0.0
+            # end_mask: test와 동일 규칙 (NaN end OR NO_END_TYPES => 0), 단 타깃 row는 항상 0
+            type_names = g_ref["type_name"].values
+            no_end = np.isin(type_names, list(NO_END_TYPES))  # type: ignore
+            end_ok = (~np.isnan(ex_raw)) & (~np.isnan(ey_raw))
+            end_mask = (end_ok & (~no_end)).astype(np.float32)
+            end_mask[-1] = 0.0
 
-        dx = np.where(end_mask > 0, ex_rel - sx_rel, 0.0).astype(np.float32)
-        dy = np.where(end_mask > 0, ey_rel - sy_rel, 0.0).astype(np.float32)
-        dx_m = (dx * field_x).astype(np.float32)
-        dy_m = (dy * field_y).astype(np.float32)
-        dist_m = np.sqrt(dx_m * dx_m + dy_m * dy_m).astype(np.float32)
-        # dist는 입력 스케일 안정화를 위해 0~1 근처로 스케일(대각선 길이로 나눔)
-        diag = float(np.sqrt(field_x * field_x + field_y * field_y))
-        dist = (dist_m / diag).astype(np.float32)
+            # absolute end filled: end가 없으면 start로 채움 (test와 동일)
+            ex_abs = (np.nan_to_num(ex_raw, nan=0.0) / field_x).astype(np.float32)  # type: ignore
+            ey_abs = (np.nan_to_num(ey_raw, nan=0.0) / field_y).astype(np.float32)  # type: ignore
+            ex_abs_filled = np.where(end_mask > 0, ex_abs, sx_abs).astype(np.float32)
+            ey_abs_filled = np.where(end_mask > 0, ey_abs, sy_abs).astype(np.float32)
 
-        # 방향 유효성은 dist_m 기준이 더 자연스러움
-        ang = np.arctan2(dy_m, dx_m).astype(np.float32)
-        eps_m = 1e-3
-        valid_dir = (end_mask > 0) & (dist_m > eps_m)
-        angle_sin = np.where(valid_dir, np.sin(ang), 0.0).astype(np.float32)
-        angle_cos = np.where(valid_dir, np.cos(ang), 0.0).astype(np.float32)
+            # --- anchor-relative coords (normalized) ---
+            sx_rel = (sx_abs - anchor_x).astype(np.float32)
+            sy_rel = (sy_abs - anchor_y).astype(np.float32)
+            ex_rel = (ex_abs_filled - anchor_x).astype(np.float32)
+            ey_rel = (ey_abs_filled - anchor_y).astype(np.float32)
 
-        t = g["time_seconds"].values.astype(np.float32)
-        dt = np.diff(t, prepend=t[0]) # type: ignore
-        dt = np.clip(dt, 0.0, None).astype(np.float32)
-        # 0~1 근처 스케일로: 대략 60초를 1 근처로
-        dt = (np.log1p(dt) / np.log1p(60.0)).astype(np.float32)
+            # relative end filled: end가 없으면 0 (relative frame) (test와 동일)
+            ex_rel_filled = np.where(end_mask > 0, ex_rel, 0.0).astype(np.float32)
+            ey_rel_filled = np.where(end_mask > 0, ey_rel, 0.0).astype(np.float32)
 
-        # anchor absolute position (normalized) as additional numeric features
-        anchor_x_feat = np.full((T,), anchor_x, dtype=np.float32)
-        anchor_y_feat = np.full((T,), anchor_y, dtype=np.float32)
+            dx = np.where(end_mask > 0, ex_rel - sx_rel, 0.0).astype(np.float32)
+            dy = np.where(end_mask > 0, ey_rel - sy_rel, 0.0).astype(np.float32)
 
-        num = np.stack(
-            [
-                sx_abs,
-                sy_abs,
-                ex_abs_filled,
-                ey_abs_filled,
-                sx_rel,
-                sy_rel,
-                ex_rel_filled,
-                ey_rel_filled,
-                end_mask,
-                dx,
-                dy,
-                dist,
-                angle_sin,
-                angle_cos,
-                dt,
-                anchor_x_feat,
-                anchor_y_feat,
-            ],
-            axis=1,
-        ).astype(np.float32)  # [T, 17]
-        cat = np.stack(
-            [
-                map_idx(g, "player_id", vocabs["player_id"]),
-                map_idx(g, "team_id", vocabs["team_id"]),
-                map_idx(g, "type_name", vocabs["type_name"]),
-                map_idx(g, "result_name", vocabs["result_name"]),
-            ],
-            axis=1,
-        ).astype(np.int64)  # [T, 4]
+            dx_m = (dx * field_x).astype(np.float32)
+            dy_m = (dy * field_y).astype(np.float32)
+            dist_m = np.sqrt(dx_m * dx_m + dy_m * dy_m).astype(np.float32)
+            # dist는 입력 스케일 안정화를 위해 0~1 근처로 스케일(대각선 길이로 나눔)
+            diag = float(np.sqrt(field_x * field_x + field_y * field_y))
+            dist = (dist_m / diag).astype(np.float32)
 
-        episodes_num.append(num)
-        episodes_cat.append(cat)
+            # 방향 유효성은 dist_m 기준이 더 자연스러움
+            ang = np.arctan2(dy_m, dx_m).astype(np.float32)
+            eps_m = 1e-3
+            valid_dir = (end_mask > 0) & (dist_m > eps_m)
+            angle_sin = np.where(valid_dir, np.sin(ang), 0.0).astype(np.float32)
+            angle_cos = np.where(valid_dir, np.cos(ang), 0.0).astype(np.float32)
 
-    return episodes_num, episodes_cat, targets, episode_game_ids
+            t = g_ref["time_seconds"].values.astype(np.float32)
+            dt = np.diff(t, prepend=t[0])  # type: ignore
+            dt = np.clip(dt, 0.0, None).astype(np.float32)
+            # 0~1 근처 스케일로: 대략 60초를 1 근처로
+            dt = (np.log1p(dt) / np.log1p(60.0)).astype(np.float32)
+
+            # anchor absolute position (normalized) as additional numeric features
+            anchor_x_feat = np.full((T,), anchor_x, dtype=np.float32)
+            anchor_y_feat = np.full((T,), anchor_y, dtype=np.float32)
+
+            num = np.stack(
+                [
+                    sx_abs,
+                    sy_abs,
+                    ex_abs_filled,
+                    ey_abs_filled,
+                    sx_rel,
+                    sy_rel,
+                    ex_rel_filled,
+                    ey_rel_filled,
+                    end_mask,
+                    dx,
+                    dy,
+                    dist,
+                    angle_sin,
+                    angle_cos,
+                    dt,
+                    anchor_x_feat,
+                    anchor_y_feat,
+                ],
+                axis=1,
+            ).astype(np.float32)  # [T, 17]
+
+            cat = np.stack(
+                [
+                    map_idx(g_ref, "player_id", vocabs["player_id"]),
+                    map_idx(g_ref, "team_id", vocabs["team_id"]),
+                    map_idx(g_ref, "type_name", vocabs["type_name"]),
+                    map_idx(g_ref, "result_name", vocabs["result_name"]),
+                ],
+                axis=1,
+            ).astype(np.int64)  # [T, 4]
+
+            episodes_num.append(num)
+            episodes_cat.append(cat)
+
+    return episodes_num, episodes_cat, targets, sample_game_ids
 
 
 def build_test_sequence_from_path(
@@ -282,17 +327,22 @@ def build_test_sequence_from_path(
     sx_abs = (g["start_x"].values / field_x).astype(np.float32)  # type: ignore
     sy_abs = (g["start_y"].values / field_y).astype(np.float32)  # type: ignore
 
-    ex_raw = g["end_x"].values.astype(np.float32)  # type: ignore
-    ey_raw = g["end_y"].values.astype(np.float32)  # type: ignore
+    type_names = g["type_name"].values
+    no_end = np.isin(type_names, list(NO_END_TYPES)) # type: ignore
+
+    ex_raw = g["end_x"].values.astype(np.float32)
+    ey_raw = g["end_y"].values.astype(np.float32)
 
     end_ok = (~np.isnan(ex_raw)) & (~np.isnan(ey_raw))
-    end_mask = end_ok.astype(np.float32)
+
+    # 핵심: NaN이 아니어도 NO_END_TYPES면 end 없다고 처리
+    end_mask = (end_ok & (~no_end)).astype(np.float32)
 
     ex_abs = (np.nan_to_num(ex_raw, nan=0.0) / field_x).astype(np.float32) # type: ignore
     ey_abs = (np.nan_to_num(ey_raw, nan=0.0) / field_y).astype(np.float32) # type: ignore
     # NaN end는 start로 채움 (absolute frame)
-    ex_abs = np.where(end_mask > 0, ex_abs, sx_abs)
-    ey_abs = np.where(end_mask > 0, ey_abs, sy_abs)
+    ex_abs = np.where(end_mask > 0, ex_abs, sx_abs).astype(np.float32)
+    ey_abs = np.where(end_mask > 0, ey_abs, sy_abs).astype(np.float32)
 
     # absolute end filled (for input)
     ex_abs_filled = ex_abs
@@ -619,6 +669,9 @@ def main(cfg: DictConfig) -> None:
     episodes_num, episodes_cat, targets, episode_game_ids = build_train_episodes(
         train_csv_path=train_path, field_x=field_x, field_y=field_y, vocabs=vocabs, max_tail_k=max_tail_k
         )
+    assert all(np.isfinite(x).all() for x in episodes_num)
+    assert np.isfinite(np.vstack(targets)).all()
+    print("OK: no NaN/inf in train sequences & targets")
     print("에피소드 수:", len(episodes_num))
 
     seed = int(cfg.train.seed) if cfg.train.seed is not None else 42
