@@ -34,15 +34,6 @@ model:
 train:
   seed: 42
   device: auto            # auto | cpu | cuda
-  # 체크포인트로부터 가중치 초기화/재개 (2-stage에서 finetune 시작점으로도 사용)
-  resume_path: null
-  # true면 pretrain(all_pass) -> finetune(last_pass) 순서로 자동 실행
-  two_stage: true
-  # finetune(stage2) 설정 (없는 값은 train 기본값을 그대로 사용)
-  stage2:
-    epochs: 10
-    lr: 3e-4
-    max_tail_k: 64
   batch_size: 64
   epochs: 20
   valid_ratio: 0.2
@@ -53,6 +44,28 @@ train:
   num_workers: 2
   pin_memory: true
   log_every_steps: 50
+  scheduler:
+    name: reduce_on_plateau   # none | reduce_on_plateau | cosine | onecycle
+    mode: min
+    factor: 0.5
+    patience: 2
+    threshold: 1e-4
+    cooldown: 0
+    min_lr: 1e-6
+  # 체크포인트로부터 가중치 초기화/재개 (2-stage에서 finetune 시작점으로도 사용)
+  resume_path: null
+  # true면 pretrain(all_pass) -> finetune(last_pass) 순서로 자동 실행
+  two_stage: true
+  # finetune(stage2) 설정 (없는 값은 train 기본값을 그대로 사용)
+  stage2:
+    epochs: 10
+    lr: 3e-4
+    max_tail_k: 64
+    scheduler:
+      name: reduce_on_plateau
+      factor: 0.5
+      patience: 1
+      min_lr: 1e-6
 
 output:
   pretrain_ckpt_name: pretrain.best.ckpt.pt

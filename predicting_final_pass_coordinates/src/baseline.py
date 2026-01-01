@@ -106,55 +106,6 @@ def unify_frame_to_ref_team(
 # -------------------------
 # Data
 # -------------------------
-def boundary_features(
-    sx_abs, sy_abs,
-    ex_abs_filled, ey_abs_filled,
-    end_mask,
-    field_x: float, field_y: float,
-    taus_m=(
-        1.0,
-        # 3.0,
-        # 6.0
-        ),
-):
-    # 좌표 튀는 경우 대비(안전)
-    sx = np.clip(sx_abs, 0.0, 1.0).astype(np.float32)
-    sy = np.clip(sy_abs, 0.0, 1.0).astype(np.float32)
-    ex = np.clip(ex_abs_filled, 0.0, 1.0).astype(np.float32)
-    ey = np.clip(ey_abs_filled, 0.0, 1.0).astype(np.float32)
-    m  = end_mask.astype(np.float32)
-
-    # min distance to goal-line (x=0 or x=1), side-line (y=0 or y=1)
-    min_goal_s = np.minimum(sx, 1.0 - sx)                # 0~0.5
-    min_side_s = np.minimum(sy, 1.0 - sy)                # 0~0.5
-    min_goal_e = np.minimum(ex, 1.0 - ex) * m            # end 없으면 0
-    min_side_e = np.minimum(ey, 1.0 - ey) * m
-
-    # Lite: 0~1로 스케일 맞추기(*2)
-    d_goal_s = (2.0 * min_goal_s).astype(np.float32)     # 0~1
-    d_side_s = (2.0 * min_side_s).astype(np.float32)
-    d_goal_e = (2.0 * min_goal_e).astype(np.float32)
-    d_side_e = (2.0 * min_side_e).astype(np.float32)
-
-    feats = [d_goal_s, d_side_s, d_goal_e, d_side_e]     # [T] x 4
-
-    # # Standard: 미터 기반 근접도(0~1), τ=1/3/6m
-    # min_goal_s_m = (min_goal_s * field_x).astype(np.float32)
-    # min_side_s_m = (min_side_s * field_y).astype(np.float32)
-    # min_goal_e_m = (min_goal_e * field_x).astype(np.float32)  # 이미 mask 적용됨
-    # min_side_e_m = (min_side_e * field_y).astype(np.float32)
-
-    # for tau in taus_m:
-    #     tau = float(tau)
-    #     near_goal_s = np.clip(1.0 - min_goal_s_m / tau, 0.0, 1.0).astype(np.float32)
-    #     near_side_s = np.clip(1.0 - min_side_s_m / tau, 0.0, 1.0).astype(np.float32)
-    #     near_goal_e = np.clip(1.0 - min_goal_e_m / tau, 0.0, 1.0).astype(np.float32)
-    #     near_side_e = np.clip(1.0 - min_side_e_m / tau, 0.0, 1.0).astype(np.float32)
-    #     feats += [near_goal_s, near_side_s, near_goal_e, near_side_e]  # τ마다 4개 추가
-
-    return feats  # list of [T] arrays
-
-
 def build_vocabs(train_csv_path: str):
     df = pd.read_csv(train_csv_path)
 
@@ -328,13 +279,6 @@ def build_train_episodes(
             anchor_x_feat = np.full((T,), anchor_x, dtype=np.float32)
             anchor_y_feat = np.full((T,), anchor_y, dtype=np.float32)
 
-            b_feats = boundary_features(
-            sx_abs, sy_abs, ex_abs_filled, ey_abs_filled,
-            end_mask=end_mask,
-            field_x=field_x, field_y=field_y,
-            taus_m=(1.0, 3.0, 6.0),
-            )
-
             num = np.stack(
                 [
                     sx_abs,
@@ -354,7 +298,6 @@ def build_train_episodes(
                     dt,
                     anchor_x_feat,
                     anchor_y_feat,
-                    *b_feats,
                 ],
                 axis=1,
             ).astype(np.float32)  # [T, 17]
@@ -459,13 +402,6 @@ def build_test_sequence_from_path(
     anchor_x_feat = np.full((T,), anchor_x, dtype=np.float32)
     anchor_y_feat = np.full((T,), anchor_y, dtype=np.float32)
 
-    b_feats = boundary_features(
-    sx_abs, sy_abs, ex_abs_filled, ey_abs_filled,
-    end_mask=end_mask,
-    field_x=field_x, field_y=field_y,
-    taus_m=(1.0, 3.0, 6.0),
-    )
-
     num = np.stack(
         [
             sx_abs,
@@ -485,7 +421,6 @@ def build_test_sequence_from_path(
             dt,
             anchor_x_feat,
             anchor_y_feat,
-            *b_feats,
         ],
         axis=1,
     ).astype(np.float32)  # [T, 17]
