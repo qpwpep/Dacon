@@ -12,6 +12,10 @@ data:
   field_y: 68.0
   # 0이면 전체 시퀀스 사용, 예: 64면 마지막 64개 action만 사용(노이즈 줄이기에 유리)
   max_tail_k: 0
+  # 학습 타깃 샘플 정책
+  # - all_pass: 에피소드 내 모든 Pass를 학습 샘플로 사용 (pretrain에 적합)
+  # - last_pass: 에피소드 마지막 Pass 1개만 사용 (test 분포 정합/finetune에 적합)
+  target_policy: all_pass     # all_pass | last_pass
 
 model:
   # numeric feature dim은 코드에서 자동 추론(현재 기본 13)
@@ -30,6 +34,15 @@ model:
 train:
   seed: 42
   device: auto            # auto | cpu | cuda
+  # 체크포인트로부터 가중치 초기화/재개 (2-stage에서 finetune 시작점으로도 사용)
+  resume_path: null
+  # true면 pretrain(all_pass) -> finetune(last_pass) 순서로 자동 실행
+  two_stage: true
+  # finetune(stage2) 설정 (없는 값은 train 기본값을 그대로 사용)
+  stage2:
+    epochs: 10
+    lr: 3e-4
+    max_tail_k: 64
   batch_size: 64
   epochs: 20
   valid_ratio: 0.2
@@ -42,6 +55,7 @@ train:
   log_every_steps: 50
 
 output:
+  pretrain_ckpt_name: pretrain.best.ckpt.pt
   ckpt_name: best.ckpt.pt
   submission_name: baseline_submit.csv
 

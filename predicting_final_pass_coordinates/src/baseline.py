@@ -5,7 +5,8 @@ import copy
 from pathlib import Path
 import shutil
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Any
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -30,6 +31,7 @@ from omegaconf import DictConfig, OmegaConf
 NO_END_TYPES = {
     "Aerial Clearance",
     "Block",
+    "Catch",
     "Deflection",
     "Error",
     "Foul",
@@ -38,7 +40,6 @@ NO_END_TYPES = {
     "Intervention",
     "Parry",
     "Take-On",
-    "Catch"
 }
 
 
@@ -105,6 +106,55 @@ def unify_frame_to_ref_team(
 # -------------------------
 # Data
 # -------------------------
+def boundary_features(
+    sx_abs, sy_abs,
+    ex_abs_filled, ey_abs_filled,
+    end_mask,
+    field_x: float, field_y: float,
+    taus_m=(
+        1.0,
+        # 3.0,
+        # 6.0
+        ),
+):
+    # 좌표 튀는 경우 대비(안전)
+    sx = np.clip(sx_abs, 0.0, 1.0).astype(np.float32)
+    sy = np.clip(sy_abs, 0.0, 1.0).astype(np.float32)
+    ex = np.clip(ex_abs_filled, 0.0, 1.0).astype(np.float32)
+    ey = np.clip(ey_abs_filled, 0.0, 1.0).astype(np.float32)
+    m  = end_mask.astype(np.float32)
+
+    # min distance to goal-line (x=0 or x=1), side-line (y=0 or y=1)
+    min_goal_s = np.minimum(sx, 1.0 - sx)                # 0~0.5
+    min_side_s = np.minimum(sy, 1.0 - sy)                # 0~0.5
+    min_goal_e = np.minimum(ex, 1.0 - ex) * m            # end 없으면 0
+    min_side_e = np.minimum(ey, 1.0 - ey) * m
+
+    # Lite: 0~1로 스케일 맞추기(*2)
+    d_goal_s = (2.0 * min_goal_s).astype(np.float32)     # 0~1
+    d_side_s = (2.0 * min_side_s).astype(np.float32)
+    d_goal_e = (2.0 * min_goal_e).astype(np.float32)
+    d_side_e = (2.0 * min_side_e).astype(np.float32)
+
+    feats = [d_goal_s, d_side_s, d_goal_e, d_side_e]     # [T] x 4
+
+    # # Standard: 미터 기반 근접도(0~1), τ=1/3/6m
+    # min_goal_s_m = (min_goal_s * field_x).astype(np.float32)
+    # min_side_s_m = (min_side_s * field_y).astype(np.float32)
+    # min_goal_e_m = (min_goal_e * field_x).astype(np.float32)  # 이미 mask 적용됨
+    # min_side_e_m = (min_side_e * field_y).astype(np.float32)
+
+    # for tau in taus_m:
+    #     tau = float(tau)
+    #     near_goal_s = np.clip(1.0 - min_goal_s_m / tau, 0.0, 1.0).astype(np.float32)
+    #     near_side_s = np.clip(1.0 - min_side_s_m / tau, 0.0, 1.0).astype(np.float32)
+    #     near_goal_e = np.clip(1.0 - min_goal_e_m / tau, 0.0, 1.0).astype(np.float32)
+    #     near_side_e = np.clip(1.0 - min_side_e_m / tau, 0.0, 1.0).astype(np.float32)
+    #     feats += [near_goal_s, near_side_s, near_goal_e, near_side_e]  # τ마다 4개 추가
+
+    return feats  # list of [T] arrays
+
+
 def build_vocabs(train_csv_path: str):
     df = pd.read_csv(train_csv_path)
 
@@ -134,7 +184,8 @@ def build_train_episodes(
     field_y: float,
     vocabs: dict,
     max_tail_k: int = 0,
-) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], List[int]]:
+    target_policy: str = "all_pass",
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], List[int], List[str]]:
     """
     train.csv -> 에피소드 단위로 시퀀스 생성
 
@@ -156,23 +207,36 @@ def build_train_episodes(
     episodes_cat: List[np.ndarray] = []
     targets: List[np.ndarray] = []
     sample_game_ids: List[int] = []
+    sample_episode_keys: List[str] = []
 
     def map_idx(g: pd.DataFrame, col: str, vocab: dict) -> np.ndarray:
         vals = g[col].fillna("None").astype(str).values
         return np.asarray([vocab.get(v, 1) for v in vals], dtype=np.int64)  # default UNK=1
 
-    for game_episode, g in tqdm(df.groupby("game_episode"), desc="Build samples (train: all Pass)"):
+    desc = f"Build samples (train: {target_policy})"
+    for game_episode, g in tqdm(df.groupby("game_episode"), desc=desc):
         if max_tail_k and max_tail_k > 0:
             g = g.tail(int(max_tail_k)).reset_index(drop=True)
 
         # 타깃 후보: Pass 계열(문자열 prefix가 "Pass")
         type_vals = g["type_name"].fillna("None").astype(str).values
         # pass_indices = np.where(np.char.startswith(type_vals.astype(str), "Pass"))[0] # type: ignore
-        pass_indices = np.where(type_vals.astype(str) == "Pass")[0] # pass만 쓰려면 이거 활성화
+        pass_indices = np.where(type_vals.astype(str) == "Pass")[0]  # pass만 쓰려면 이거 활성화
         if len(pass_indices) == 0:
             continue
 
+        tp = str(target_policy).strip().lower()
+        if tp not in ("all_pass", "last_pass"):
+            raise ValueError(f"Invalid target_policy={target_policy!r}. Use 'all_pass' or 'last_pass'.")
+        if tp == "last_pass":
+            # 가능한 한 test와 맞추기: 에피소드 마지막 action이 Pass면 그 1개만 사용
+            if len(type_vals) > 0 and str(type_vals[-1]) == "Pass":
+                pass_indices = np.array([len(type_vals) - 1], dtype=int)
+            else:
+                # 마지막 action이 Pass가 아니면, 마지막 Pass 1개만 사용(백업)
+                pass_indices = np.array([int(pass_indices[-1])], dtype=int)
         game_id = int(str(game_episode).split("_", 1)[0])
+        episode_key = str(game_episode)
 
         # 같은 episode 안에서는 ref_team이 최대 2개뿐이라, team별 unify 결과를 캐시해서 재사용
         team_vals = g["team_id"].astype(int).values
@@ -210,6 +274,7 @@ def build_train_episodes(
             )
             targets.append(tgt)
             sample_game_ids.append(game_id)
+            sample_episode_keys.append(episode_key)
 
             T = len(g_ref)
 
@@ -263,6 +328,13 @@ def build_train_episodes(
             anchor_x_feat = np.full((T,), anchor_x, dtype=np.float32)
             anchor_y_feat = np.full((T,), anchor_y, dtype=np.float32)
 
+            b_feats = boundary_features(
+            sx_abs, sy_abs, ex_abs_filled, ey_abs_filled,
+            end_mask=end_mask,
+            field_x=field_x, field_y=field_y,
+            taus_m=(1.0, 3.0, 6.0),
+            )
+
             num = np.stack(
                 [
                     sx_abs,
@@ -282,6 +354,7 @@ def build_train_episodes(
                     dt,
                     anchor_x_feat,
                     anchor_y_feat,
+                    *b_feats,
                 ],
                 axis=1,
             ).astype(np.float32)  # [T, 17]
@@ -299,7 +372,7 @@ def build_train_episodes(
             episodes_num.append(num)
             episodes_cat.append(cat)
 
-    return episodes_num, episodes_cat, targets, sample_game_ids
+    return episodes_num, episodes_cat, targets, sample_game_ids, sample_episode_keys
 
 
 def build_test_sequence_from_path(
@@ -386,6 +459,13 @@ def build_test_sequence_from_path(
     anchor_x_feat = np.full((T,), anchor_x, dtype=np.float32)
     anchor_y_feat = np.full((T,), anchor_y, dtype=np.float32)
 
+    b_feats = boundary_features(
+    sx_abs, sy_abs, ex_abs_filled, ey_abs_filled,
+    end_mask=end_mask,
+    field_x=field_x, field_y=field_y,
+    taus_m=(1.0, 3.0, 6.0),
+    )
+
     num = np.stack(
         [
             sx_abs,
@@ -405,6 +485,7 @@ def build_test_sequence_from_path(
             dt,
             anchor_x_feat,
             anchor_y_feat,
+            *b_feats,
         ],
         axis=1,
     ).astype(np.float32)  # [T, 17]
@@ -664,161 +745,308 @@ def main(cfg: DictConfig) -> None:
     # Build dataset
     # -----------------
     vocabs, vocab_sizes = build_vocabs(train_path)
-    max_tail_k = int(cfg.data.max_tail_k) if "max_tail_k" in cfg.data else 0
-
-    episodes_num, episodes_cat, targets, episode_game_ids = build_train_episodes(
-        train_csv_path=train_path, field_x=field_x, field_y=field_y, vocabs=vocabs, max_tail_k=max_tail_k
-        )
-    assert all(np.isfinite(x).all() for x in episodes_num)
-    assert np.isfinite(np.vstack(targets)).all()
-    print("OK: no NaN/inf in train sequences & targets")
-    print("에피소드 수:", len(episodes_num))
-
-    seed = int(cfg.train.seed) if cfg.train.seed is not None else 42
-    gss = GroupShuffleSplit(n_splits=1, test_size=float(cfg.train.valid_ratio), random_state=seed)
-    idx_train, idx_valid = next(gss.split(np.arange(len(episodes_num)), groups=episode_game_ids))
-    train_games = set(np.array(episode_game_ids)[idx_train])
-    valid_games = set(np.array(episode_game_ids)[idx_valid])
-    print("overlap games:", len(train_games & valid_games))  # 반드시 0이어야 함
-    print("train games:", len(train_games), "valid games:", len(valid_games))
-
-    episodes_num_train = [episodes_num[i] for i in idx_train]
-    episodes_cat_train = [episodes_cat[i] for i in idx_train]
-    targets_train = [targets[i] for i in idx_train]
-
-    episodes_num_valid = [episodes_num[i] for i in idx_valid]
-    episodes_cat_valid = [episodes_cat[i] for i in idx_valid]
-    targets_valid = [targets[i] for i in idx_valid]
-    print("train episodes:", len(episodes_num_train), "valid episodes:", len(episodes_num_valid))
-
-    train_loader = DataLoader(
-        EpisodeDataset(episodes_num_train, episodes_cat_train, targets_train),
-        batch_size=int(cfg.train.batch_size),
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=int(cfg.train.num_workers),
-        pin_memory=bool(cfg.train.pin_memory),
-    )
-    valid_loader = DataLoader(
-        EpisodeDataset(episodes_num_valid, episodes_cat_valid, targets_valid),
-        batch_size=int(cfg.train.batch_size),
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=int(cfg.train.num_workers),
-        pin_memory=bool(cfg.train.pin_memory),
-    )
 
     # -----------------
-    # Model / Optim
+    # Stage configuration
     # -----------------
-    numeric_dim = int(episodes_num_train[0].shape[1])  # 13
-    # emb_dims는 config(model.emb_dims)에서 가져오고, 없으면 기본값 사용
-    if "emb_dims" in cfg.model and cfg.model.emb_dims is not None:
-        emb_dims = OmegaConf.to_container(cfg.model.emb_dims, resolve=True)  # type: ignore
+    target_policy = str(getattr(cfg.data, "target_policy", "all_pass")).strip()
+    resume_path = str(getattr(cfg.train, "resume_path", "") or "").strip()
+
+    two_stage = bool(getattr(cfg.train, "two_stage", False))
+    stage2_cfg = cfg.train.stage2 if ("stage2" in cfg.train) else None
+
+    # stage2에서 data.max_tail_k를 덮어쓰고 싶으면 train.stage2.max_tail_k를 사용
+    def get_stage_param(stage_cfg: Any, key: str, fallback: Any) -> Any:
+        try:
+            if stage_cfg is not None and (key in stage_cfg) and stage_cfg[key] is not None:
+                return stage_cfg[key]
+        except Exception:
+            pass
+        return fallback
+
+    pretrain_ckpt_name = str(getattr(cfg.output, "pretrain_ckpt_name", "pretrain.best.ckpt.pt"))
+    finetune_ckpt_name = str(getattr(cfg.output, "ckpt_name", "best.ckpt.pt"))
+
+    # 실행할 stage 목록 구성
+    # - two_stage=false: data.target_policy로 1-stage 학습
+    # - two_stage=true & resume_path 비어있음: pretrain(all_pass) -> finetune(last_pass)
+    # - two_stage=true & resume_path 있음: pretrain을 건너뛰고 해당 ckpt로 finetune만 수행
+    stages: List[Tuple[str, str, Any, str]] = []
+    if two_stage:
+        if resume_path:
+            stages = [("finetune", "last_pass", stage2_cfg, finetune_ckpt_name)]
+            print(f"[2-stage] resume_path is set -> skip pretrain, finetune from: {resume_path}")
+        else:
+            stages = [
+                ("pretrain", "all_pass", cfg.train, pretrain_ckpt_name),
+                ("finetune", "last_pass", stage2_cfg, finetune_ckpt_name),
+            ]
     else:
-        emb_dims = {"player_id": 16, "team_id": 8, "type_name": 8, "result_name": 4}
+        stages = [("train", target_policy, cfg.train, finetune_ckpt_name)]
 
-    model = LSTMWithEmb(
-        numeric_dim=numeric_dim,
-        vocab_sizes=vocab_sizes,
-        emb_dims=emb_dims, # type: ignore
-        hidden_dim=int(cfg.model.hidden_dim),
-        num_layers=int(cfg.model.num_layers),
-        dropout=float(cfg.model.dropout),
-        bidirectional=bool(cfg.model.bidirectional),
-        emb_dropout=float(cfg.model.get("emb_dropout", 0.0)),
-    ).to(device)
+    model: Optional[nn.Module] = None
+    final_best_ckpt_path: Optional[Path] = None
 
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=float(cfg.train.lr),
-        weight_decay=float(cfg.train.weight_decay),
-    )
+    # split을 stage 간에 공유(게임 누수 방지 & 비교 공정성)
+    train_games: Optional[set] = None
+    valid_games: Optional[set] = None
 
-    if wandb_run is not None:
-        # 파라미터 수 같은 메타 정보 기록
-        n_params = sum(p.numel() for p in model.parameters())
-        wandb_run.log({"model/n_params": n_params})
+    epoch_offset = 0
 
-    # -----------------
-    # Train loop
-    # -----------------
-    best_dist = float("inf")
-    best_epoch = -1
-    ckpt_dir = Path("checkpoints")
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    for stage_idx, (stage_name, stage_policy, stage_cfg, stage_ckpt_name) in enumerate(stages, start=1):
+        print("\n" + "=" * 80)
+        print(f"[Stage {stage_idx}/{len(stages)}] {stage_name} | target_policy={stage_policy}")
+        print("=" * 80)
 
-    best_ckpt_path = ckpt_dir / str(cfg.output.ckpt_name)  # cfg.output.ckpt_name 사용
-    stem, suffix = best_ckpt_path.stem, best_ckpt_path.suffix
+        # stage별 hyperparams (없는 값은 train 기본값으로 fallback)
+        stage_epochs = int(get_stage_param(stage_cfg, "epochs", cfg.train.epochs))
+        stage_batch_size = int(get_stage_param(stage_cfg, "batch_size", cfg.train.batch_size))
+        stage_lr = float(get_stage_param(stage_cfg, "lr", cfg.train.lr))
+        stage_weight_decay = float(get_stage_param(stage_cfg, "weight_decay", cfg.train.weight_decay))
+        stage_grad_clip = float(get_stage_param(stage_cfg, "grad_clip", cfg.train.grad_clip))
+        stage_amp = bool(get_stage_param(stage_cfg, "amp", cfg.train.amp))
+        stage_num_workers = int(get_stage_param(stage_cfg, "num_workers", cfg.train.num_workers))
+        stage_pin_memory = bool(get_stage_param(stage_cfg, "pin_memory", cfg.train.pin_memory))
+        stage_log_every = int(get_stage_param(stage_cfg, "log_every_steps", cfg.train.log_every_steps))
 
-    for epoch in range(1, int(cfg.train.epochs) + 1):
-        train_loss = train_one_epoch(
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            device=device,
-            field_x=field_x,
-            field_y=field_y,
-            grad_clip=float(cfg.train.grad_clip),
-            amp=bool(cfg.train.amp),
-            log_every_steps=int(cfg.train.log_every_steps),
-            wandb_run=wandb_run,
-            epoch=epoch,
-        )
-
-        valid_mean_dist = evaluate(
-            model=model,
-            loader=valid_loader,
-            device=device,
-            field_x=field_x,
-            field_y=field_y,
-        )
+        stage_max_tail_k = int(get_stage_param(stage_cfg, "max_tail_k", getattr(cfg.data, "max_tail_k", 0)))
 
         print(
-            f"[Epoch {epoch}] "
-            f"train_loss(m)={train_loss:.4f} | "
-            f"valid_mean_dist(m)={valid_mean_dist:.4f}"
+            f"stage_epochs={stage_epochs} batch_size={stage_batch_size} lr={stage_lr} "
+            f"max_tail_k={stage_max_tail_k} amp={stage_amp}"
         )
 
-        if wandb_run is not None:
-            wandb_run.log(
-                {
-                    "epoch": epoch,
-                    "train/epoch_loss_m": float(train_loss),
-                    "valid/mean_dist_m": float(valid_mean_dist),
-                    "best/mean_dist_m": float(min(best_dist, valid_mean_dist)),
-                }
+        # -----------------
+        # Build episodes for this stage
+        # -----------------
+        episodes_num, episodes_cat, targets, episode_game_ids, episode_keys = build_train_episodes(
+            train_csv_path=train_path,
+            field_x=field_x,
+            field_y=field_y,
+            vocabs=vocabs,
+            max_tail_k=stage_max_tail_k,
+            target_policy=stage_policy,
+        )
+
+        assert len(episodes_num) > 0, "No training episodes were built. Check your data & target_policy."
+        assert all(np.isfinite(x).all() for x in episodes_num)
+        assert np.isfinite(np.vstack(targets)).all()
+        print("OK: no NaN/inf in train sequences & targets")
+        print("에피소드 수:", len(episodes_num))
+
+        # -----------------
+        # Split by game_id (group split)
+        # -----------------
+        if train_games is None or valid_games is None:
+            seed = int(cfg.train.seed) if cfg.train.seed is not None else 42
+            gss = GroupShuffleSplit(n_splits=1, test_size=float(cfg.train.valid_ratio), random_state=seed)
+            idx_train, idx_valid = next(gss.split(np.arange(len(episodes_num)), groups=episode_game_ids))
+            train_games = set(np.array(episode_game_ids)[idx_train])
+            valid_games = set(np.array(episode_game_ids)[idx_valid])
+            print("overlap games:", len(train_games & valid_games))  # 반드시 0이어야 함
+            print("train games:", len(train_games), "valid games:", len(valid_games))
+        else:
+            # stage2: stage1에서 뽑은 game split을 그대로 사용
+            idx_train = np.array([i for i, gid in enumerate(episode_game_ids) if gid in train_games], dtype=int)
+            idx_valid = np.array([i for i, gid in enumerate(episode_game_ids) if gid in valid_games], dtype=int)
+            print("[reuse split] train episodes:", len(idx_train), "valid episodes:", len(idx_valid))
+            print("overlap games:", len(train_games & valid_games))
+
+        episodes_num_train = [episodes_num[i] for i in idx_train]
+        episodes_cat_train = [episodes_cat[i] for i in idx_train]
+        targets_train = [targets[i] for i in idx_train]
+
+        episodes_num_valid = [episodes_num[i] for i in idx_valid]
+        episodes_cat_valid = [episodes_cat[i] for i in idx_valid]
+        targets_valid = [targets[i] for i in idx_valid]
+        print("train episodes:", len(episodes_num_train), "valid episodes:", len(episodes_num_valid))
+
+        # -----------------
+        # Sanity check: last_pass should be one sample per game_episode (no duplicates)
+        # -----------------
+        if str(stage_policy).strip().lower() == "last_pass":
+            total_all = len(episode_keys)
+            uniq_all = len(set(episode_keys))
+            dup_all = total_all - uniq_all
+            print(f"[Check] last_pass overall: samples={total_all} unique_game_episode={uniq_all} dup={dup_all}")
+
+            train_keys = [episode_keys[i] for i in idx_train]
+            valid_keys = [episode_keys[i] for i in idx_valid]
+            total_tr, uniq_tr = len(train_keys), len(set(train_keys))
+            total_va, uniq_va = len(valid_keys), len(set(valid_keys))
+            print(f"[Check] last_pass train subset: samples={total_tr} unique_game_episode={uniq_tr} dup={total_tr-uniq_tr}")
+            print(f"[Check] last_pass valid subset: samples={total_va} unique_game_episode={uniq_va} dup={total_va-uniq_va}")
+
+            if total_va != uniq_va:
+                ctr = Counter(valid_keys)
+                dups = [k for k, c in ctr.items() if c > 1]
+                examples = dups[:10]
+                print(f"[Check][WARN] Duplicated game_episode keys in VALID (n={len(dups)}). Examples: {examples}")
+
+            # Stage2(=finetune)에서는 엄격하게 1-episode-1-sample을 보장하도록 assert
+            if stage_name == "finetune":
+                assert total_va == uniq_va, (
+                    f"Stage2(valid) is not one-sample-per-episode: samples={total_va}, unique_game_episode={uniq_va}. "
+                    f"Check target_policy=last_pass generation / split mapping."
+                )
+                assert total_tr == uniq_tr, (
+                    f"Stage2(train) is not one-sample-per-episode: samples={total_tr}, unique_game_episode={uniq_tr}. "
+                    f"Check target_policy=last_pass generation / split mapping."
+                )
+
+        train_loader = DataLoader(
+            EpisodeDataset(episodes_num_train, episodes_cat_train, targets_train),
+            batch_size=stage_batch_size,
+            shuffle=True,
+            num_workers=stage_num_workers,
+            pin_memory=stage_pin_memory,
+            collate_fn=collate_fn,
+        )
+        valid_loader = DataLoader(
+            EpisodeDataset(episodes_num_valid, episodes_cat_valid, targets_valid),
+            batch_size=stage_batch_size,
+            shuffle=False,
+            num_workers=stage_num_workers,
+            pin_memory=stage_pin_memory,
+            collate_fn=collate_fn,
+        )
+
+        # -----------------
+        # Build / Load model (once)
+        # -----------------
+        if model is None:
+            numeric_dim = int(episodes_num_train[0].shape[1])
+            if "emb_dims" in cfg.model:
+                emb_dims = dict(cfg.model.emb_dims)  # type: ignore
+            else:
+                emb_dims = {"player_id": 16, "team_id": 8, "type_name": 8, "result_name": 4}
+
+            model = LSTMWithEmb(
+                numeric_dim=numeric_dim,
+                vocab_sizes=vocab_sizes,
+                emb_dims=emb_dims,  # type: ignore
+                hidden_dim=int(cfg.model.hidden_dim),
+                num_layers=int(cfg.model.num_layers),
+                dropout=float(cfg.model.dropout),
+                bidirectional=bool(cfg.model.bidirectional),
+                emb_dropout=float(getattr(cfg.model, "emb_dropout", 0.0)),
+            ).to(device)
+
+            if wandb_run is not None:
+                n_params = sum(p.numel() for p in model.parameters())
+                wandb_run.log({"model/n_params": n_params})
+
+        assert model is not None
+
+        # stage 시작 전: resume_path가 있으면 가중치 로드(=프리트레인 결과로 초기화 or 학습 재개)
+        if resume_path and stage_name != "pretrain":
+            ckpt_init = load_checkpoint(resume_path, model=model, optimizer=None)
+            print(
+                f"[init] Loaded weights from: {resume_path} "
+                f"(epoch={ckpt_init.get('epoch')} best_metric={ckpt_init.get('best_metric')})"
             )
+            # resume_path는 한 번만 쓰도록 비워둠(연속 stage에서 중복 로드 방지)
+            resume_path = ""
 
-        if valid_mean_dist < best_dist:
-            dist = float(valid_mean_dist)
-            best_dist = dist
-            best_epoch = epoch
+        # stage별 optimizer는 새로 생성(파인튜닝 시 optimizer reset 권장)
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=stage_lr,
+            weight_decay=stage_weight_decay,
+        )
 
-            ckpt_epoch_path = ckpt_dir / f"{stem}_epoch{epoch:03d}_dist{dist:.4f}{suffix}"
+        # -----------------
+        # Train loop (this stage)
+        # -----------------
+        best_dist = float("inf")
+        best_epoch = -1
+        ckpt_dir = Path("checkpoints")
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-            # 1) epoch별 불변 파일로 저장
-            save_checkpoint(
-                path=str(ckpt_epoch_path),
+        best_ckpt_path = ckpt_dir / str(stage_ckpt_name)
+        stem, suffix = best_ckpt_path.stem, best_ckpt_path.suffix
+
+        for local_epoch in range(1, stage_epochs + 1):
+            global_epoch = epoch_offset + local_epoch
+
+            train_loss = train_one_epoch(
                 model=model,
+                loader=train_loader,
                 optimizer=optimizer,
-                epoch=epoch,
-                best_metric=dist,
-                cfg_dict=OmegaConf.to_container(cfg, resolve=True), # type: ignore
+                device=device,
+                field_x=field_x,
+                field_y=field_y,
+                grad_clip=stage_grad_clip,
+                amp=stage_amp,
+                log_every_steps=stage_log_every,
+                wandb_run=wandb_run,
+                epoch=global_epoch,
             )
 
-            # 2) best 파일은 복사본으로만 갱신 (로드 편의)
-            shutil.copy2(str(ckpt_epoch_path), str(best_ckpt_path))
+            valid_mean_dist = evaluate(
+                model=model,
+                loader=valid_loader,
+                device=device,
+                field_x=field_x,
+                field_y=field_y,
+            )
 
-            print(f" --> Best model saved! epoch={epoch}, dist={dist:.4f}")
+            print(
+                f"[{stage_name}] epoch {local_epoch}/{stage_epochs} (global {global_epoch}) | "
+                f"train_loss={train_loss:.4f} valid_mean_dist={valid_mean_dist:.4f}"
+            )
 
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "stage/idx": stage_idx,
+                        "stage/name": stage_name,
+                        "stage/policy": stage_policy,
+                        "epoch": global_epoch,
+                        f"{stage_name}/train/epoch_loss_m": float(train_loss),
+                        f"{stage_name}/valid/mean_dist_m": float(valid_mean_dist),
+                    }
+                )
 
-    # -----------------
+            if valid_mean_dist < best_dist:
+                dist = float(valid_mean_dist)
+                best_dist = dist
+                best_epoch = local_epoch
+
+                ckpt_epoch_path = ckpt_dir / f"{stem}_{stage_name}_epoch{global_epoch:03d}_dist{dist:.4f}{suffix}"
+
+                save_checkpoint(
+                    path=str(ckpt_epoch_path),
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=global_epoch,
+                    best_metric=dist,
+                    cfg_dict=OmegaConf.to_container(cfg, resolve=True),  # type: ignore
+                )
+
+                shutil.copy2(str(ckpt_epoch_path), str(best_ckpt_path))
+                print(f" --> [{stage_name}] Best model saved! global_epoch={global_epoch}, dist={dist:.4f}")
+
+        # stage 종료 후 best 로드(다음 stage의 시작점)
+        ckpt_best = load_checkpoint(str(best_ckpt_path), model=model, optimizer=None)
+        model.eval()
+        print(
+            f"[{stage_name}] Loaded best checkpoint: epoch={ckpt_best.get('epoch')} best_metric={ckpt_best.get('best_metric')}"
+        )
+
+        final_best_ckpt_path = best_ckpt_path
+        epoch_offset += stage_epochs
+
+    assert final_best_ckpt_path is not None, "Training finished without a checkpoint."
+
+    # 최종 stage(best)를 inference에 사용
+    best_ckpt_path = final_best_ckpt_path
+# -----------------
     # Load best + inference
     # -----------------
-    ckpt = load_checkpoint(str(best_ckpt_path), model=model, optimizer=None)
+    ckpt = load_checkpoint(str(best_ckpt_path), model=model, optimizer=None) # type: ignore
 
-    model.eval()
+    model.eval() # type: ignore
     print(f"Loaded best checkpoint: epoch={ckpt.get('epoch')} best_metric={ckpt.get('best_metric')}")
 
     # test_meta + sample_submission merge 방식 유지 fileciteturn2file0L204-L207
@@ -832,7 +1060,7 @@ def main(cfg: DictConfig) -> None:
     for _, row in tqdm(submission.iterrows(), total=len(submission), desc="Inference"):
         episode_path = to_absolute_path(str(row["path"]))  # test.csv의 path 컬럼
         num, cat, anchor = build_test_sequence_from_path(
-            episode_path, field_x=field_x, field_y=field_y, vocabs=vocabs, max_tail_k=max_tail_k
+            episode_path, field_x=field_x, field_y=field_y, vocabs=vocabs, max_tail_k=stage_max_tail_k
         )
 
         x_num = torch.tensor(num, dtype=torch.float32).unsqueeze(0).to(device)  # [1, T, F]
@@ -840,7 +1068,7 @@ def main(cfg: DictConfig) -> None:
         length = torch.tensor([num.shape[0]]).to(device)
 
         with torch.no_grad():
-            pred = model(x_num, x_cat, length).detach().cpu().numpy()[0]  # [2]
+            pred = model(x_num, x_cat, length).detach().cpu().numpy()[0]  # type: ignore # [2]
 
         # pred is delta in normalized coords (anchor-relative)
         end_norm = pred + anchor  # absolute normalized end position
