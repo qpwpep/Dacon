@@ -16,9 +16,11 @@ data:
   # - all_pass: 에피소드 내 모든 Pass를 학습 샘플로 사용 (pretrain에 적합)
   # - last_pass: 에피소드 마지막 Pass 1개만 사용 (test 분포 정합/finetune에 적합)
   target_policy: all_pass     # all_pass | last_pass
+  dt_clip_sec: 60.0           # dt(time_seconds 차이) 클리핑 상한(초). 중단/재개 등으로 큰 dt가 생길 때 학습 안정화.
+  dt_norm_ref_sec: 60.0       # dt 정규화 기준(초). dt = log1p(clip(dt))/log1p(dt_norm_ref_sec)
 
 model:
-  # numeric feature dim은 코드에서 자동 추론(현재 기본 13)
+  # numeric feature dim은 코드에서 자동 추론(현재 기본 17)
   hidden_dim: 128
   num_layers: 2
   dropout: 0.1
@@ -44,14 +46,6 @@ train:
   num_workers: 2
   pin_memory: true
   log_every_steps: 50
-  scheduler:
-    name: reduce_on_plateau   # none | reduce_on_plateau | cosine | onecycle
-    mode: min
-    factor: 0.5
-    patience: 2
-    threshold: 1e-4
-    cooldown: 0
-    min_lr: 1e-6
   # 체크포인트로부터 가중치 초기화/재개 (2-stage에서 finetune 시작점으로도 사용)
   resume_path: null
   # true면 pretrain(all_pass) -> finetune(last_pass) 순서로 자동 실행
@@ -61,11 +55,6 @@ train:
     epochs: 10
     lr: 3e-4
     max_tail_k: 64
-    scheduler:
-      name: reduce_on_plateau
-      factor: 0.5
-      patience: 1
-      min_lr: 1e-6
 
 output:
   pretrain_ckpt_name: pretrain.best.ckpt.pt

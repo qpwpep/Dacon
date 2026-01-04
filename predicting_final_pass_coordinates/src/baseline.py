@@ -136,6 +136,8 @@ def build_train_episodes(
     vocabs: dict,
     max_tail_k: int = 0,
     target_policy: str = "all_pass",
+    dt_clip_sec: float = 60.0,
+    dt_norm_ref_sec: float = 60.0,
 ) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], List[int], List[str]]:
     """
     train.csv -> 에피소드 단위로 시퀀스 생성
@@ -270,10 +272,10 @@ def build_train_episodes(
             angle_cos = np.where(valid_dir, np.cos(ang), 0.0).astype(np.float32)
 
             t = g_ref["time_seconds"].values.astype(np.float32)
-            dt = np.diff(t, prepend=t[0])  # type: ignore
-            dt = np.clip(dt, 0.0, None).astype(np.float32)
+            dt = np.diff(t, prepend=t[0]) # type: ignore
+            dt = np.clip(dt, 0.0, dt_clip_sec).astype(np.float32)
             # 0~1 근처 스케일로: 대략 60초를 1 근처로
-            dt = (np.log1p(dt) / np.log1p(60.0)).astype(np.float32)
+            dt = (np.log1p(dt) / np.log1p(dt_norm_ref_sec)).astype(np.float32)
 
             # anchor absolute position (normalized) as additional numeric features
             anchor_x_feat = np.full((T,), anchor_x, dtype=np.float32)
@@ -324,6 +326,8 @@ def build_test_sequence_from_path(
     field_y: float,
     vocabs: dict,
     max_tail_k: int = 0,
+    dt_clip_sec: float = 60.0,
+    dt_norm_ref_sec: float = 60.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     test의 개별 에피소드 csv -> (num_seq, cat_seq)
@@ -394,8 +398,8 @@ def build_test_sequence_from_path(
 
     t = g["time_seconds"].values.astype(np.float32)
     dt = np.diff(t, prepend=t[0]) # type: ignore
-    dt = np.clip(dt, 0.0, None).astype(np.float32)
-    dt = (np.log1p(dt) / np.log1p(60.0)).astype(np.float32)
+    dt = np.clip(dt, 0.0, dt_clip_sec).astype(np.float32)
+    dt = (np.log1p(dt) / np.log1p(dt_norm_ref_sec)).astype(np.float32)
 
     T = len(g)
     # anchor absolute position (normalized) as additional numeric features
@@ -657,6 +661,15 @@ def main(cfg: DictConfig) -> None:
     field_x = float(cfg.data.field_x)
     field_y = float(cfg.data.field_y)
 
+    # dt is computed as diff(time_seconds). Clamp long gaps (e.g., stoppages) for stability.
+    # If config does not define dt_clip_sec, default to 60 seconds (keeps the original dt scaling intent).
+    dt_clip_sec = float(getattr(cfg.data, "dt_clip_sec", 60.0))
+
+    # dt scaling reference (seconds). Controls dt normalization: log1p(dt)/log1p(dt_norm_ref_sec)
+    dt_norm_ref_sec = float(getattr(cfg.data, "dt_norm_ref_sec", 60.0))
+    if not np.isfinite(dt_norm_ref_sec) or dt_norm_ref_sec <= 0:
+        raise ValueError(f"data.dt_norm_ref_sec must be a positive finite number, got {dt_norm_ref_sec!r}")
+
     # -----------------
     # W&B init
     # -----------------
@@ -761,6 +774,8 @@ def main(cfg: DictConfig) -> None:
             vocabs=vocabs,
             max_tail_k=stage_max_tail_k,
             target_policy=stage_policy,
+            dt_clip_sec=dt_clip_sec,
+            dt_norm_ref_sec=dt_norm_ref_sec,
         )
 
         assert len(episodes_num) > 0, "No training episodes were built. Check your data & target_policy."
@@ -995,7 +1010,7 @@ def main(cfg: DictConfig) -> None:
     for _, row in tqdm(submission.iterrows(), total=len(submission), desc="Inference"):
         episode_path = to_absolute_path(str(row["path"]))  # test.csv의 path 컬럼
         num, cat, anchor = build_test_sequence_from_path(
-            episode_path, field_x=field_x, field_y=field_y, vocabs=vocabs, max_tail_k=stage_max_tail_k
+            episode_path, field_x=field_x, field_y=field_y, vocabs=vocabs, max_tail_k=stage_max_tail_k, dt_clip_sec=dt_clip_sec, dt_norm_ref_sec=dt_norm_ref_sec,
         )
 
         x_num = torch.tensor(num, dtype=torch.float32).unsqueeze(0).to(device)  # [1, T, F]
