@@ -277,6 +277,25 @@ def build_train_episodes(
             # 0~1 근처 스케일로: 대략 60초를 1 근처로
             dt = (np.log1p(dt) / np.log1p(dt_norm_ref_sec)).astype(np.float32)
 
+            # ---- absolute time / index features ----
+            t_abs = g_ref["time_seconds"].values.astype(np.float32)
+            t_abs = np.clip(t_abs, 0.0, 4000.0).astype(np.float32) # type: ignore
+            t_abs_log = (np.log1p(t_abs) / np.log1p(3600.0)).astype(np.float32)
+
+            if "period_id" in g_ref.columns:
+                is_second_half = (g_ref["period_id"].values.astype(np.int64) == 2).astype(np.float32) # type: ignore
+            else:
+                is_second_half = np.zeros((T,), dtype=np.float32)
+
+            if T > 1:
+                idx = np.arange(T, dtype=np.float32)
+                denom = float(T - 1)
+                idx_norm = (idx / denom).astype(np.float32)
+                steps_to_target = ((denom - idx) / denom).astype(np.float32)
+            else:
+                idx_norm = np.zeros((T,), dtype=np.float32)
+                steps_to_target = np.zeros((T,), dtype=np.float32)
+
             # anchor absolute position (normalized) as additional numeric features
             anchor_x_feat = np.full((T,), anchor_x, dtype=np.float32)
             anchor_y_feat = np.full((T,), anchor_y, dtype=np.float32)
@@ -298,6 +317,10 @@ def build_train_episodes(
                     angle_sin,
                     angle_cos,
                     dt,
+                    t_abs_log,
+                    is_second_half,
+                    idx_norm,
+                    steps_to_target,
                     anchor_x_feat,
                     anchor_y_feat,
                 ],
@@ -343,6 +366,9 @@ def build_test_sequence_from_path(
 
     ref_team = int(g["team_id"].iloc[-1])
     g = unify_frame_to_ref_team(g, ref_team_id=ref_team, field_x=field_x, field_y=field_y)
+
+    T = len(g)
+
         # --- absolute normalized coords (0~1) ---
     sx_abs = (g["start_x"].values / field_x).astype(np.float32)  # type: ignore
     sy_abs = (g["start_y"].values / field_y).astype(np.float32)  # type: ignore
@@ -401,7 +427,25 @@ def build_test_sequence_from_path(
     dt = np.clip(dt, 0.0, dt_clip_sec).astype(np.float32)
     dt = (np.log1p(dt) / np.log1p(dt_norm_ref_sec)).astype(np.float32)
 
-    T = len(g)
+    # ---- absolute time / index features ----
+    t_abs = g["time_seconds"].values.astype(np.float32)
+    t_abs = np.clip(t_abs, 0.0, 4000.0).astype(np.float32) # type: ignore
+    t_abs_log = (np.log1p(t_abs) / np.log1p(3600.0)).astype(np.float32)
+
+    if "period_id" in g.columns:
+        is_second_half = (g["period_id"].values.astype(np.int64) == 2).astype(np.float32) # type: ignore
+    else:
+        is_second_half = np.zeros((T,), dtype=np.float32)
+
+    if T > 1:
+        idx = np.arange(T, dtype=np.float32)
+        denom = float(T - 1)
+        idx_norm = (idx / denom).astype(np.float32)
+        steps_to_target = ((denom - idx) / denom).astype(np.float32)
+    else:
+        idx_norm = np.zeros((T,), dtype=np.float32)
+        steps_to_target = np.zeros((T,), dtype=np.float32)
+
     # anchor absolute position (normalized) as additional numeric features
     anchor_x_feat = np.full((T,), anchor_x, dtype=np.float32)
     anchor_y_feat = np.full((T,), anchor_y, dtype=np.float32)
@@ -423,6 +467,10 @@ def build_test_sequence_from_path(
             angle_sin,
             angle_cos,
             dt,
+            t_abs_log,
+            is_second_half,
+            idx_norm,
+            steps_to_target,
             anchor_x_feat,
             anchor_y_feat,
         ],
@@ -899,11 +947,21 @@ def main(cfg: DictConfig) -> None:
             resume_path = ""
 
         # stage별 optimizer는 새로 생성(파인튜닝 시 optimizer reset 권장)
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=stage_lr,
-            weight_decay=stage_weight_decay,
-        )
+        opt_name = str(get_stage_param(stage_cfg, "optimizer", getattr(cfg.train, "optimizer", "adamw"))).lower()
+        if opt_name in ("adamw", "adam_w"):
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=stage_lr,
+                weight_decay=stage_weight_decay,
+            )
+        elif opt_name == "adam":
+            optimizer = torch.optim.Adam(
+                model.parameters(),
+                lr=stage_lr,
+                weight_decay=stage_weight_decay,
+            )
+        else:
+            raise ValueError(f"Unsupported optimizer: {opt_name!r}. Use 'adamw' or 'adam'.")
 
         # -----------------
         # Train loop (this stage)
