@@ -716,8 +716,138 @@ def make_fold_filename(path_like: str, fold_id: int) -> str:
     return str(p.with_name(f"{p.stem}.fold{int(fold_id):02d}{p.suffix}"))
 
 
+
+def project_point_unit_square(anchor: np.ndarray, point: np.ndarray) -> np.ndarray:
+    """Direction-preserving projection onto [0,1]^2.
+
+    Given an anchor inside the unit square and a (possibly out-of-bounds) point,
+    return the intersection of the ray (anchor -> point) with the unit square.
+    If point is already inside, it is returned unchanged.
+    """
+    a = np.asarray(anchor, dtype=np.float32)
+    p = np.asarray(point, dtype=np.float32)
+
+    # Fast path: already inside
+    if (0.0 <= p[0] <= 1.0) and (0.0 <= p[1] <= 1.0):
+        return p
+
+    d = p - a  # direction (delta)
+
+    # Compute maximum feasible t in [0,1] so that a + t*d stays in [0,1]^2
+    if d[0] > 0:
+        tx = (1.0 - a[0]) / d[0]
+    elif d[0] < 0:
+        tx = (0.0 - a[0]) / d[0]
+    else:
+        tx = float("inf")
+
+    if d[1] > 0:
+        ty = (1.0 - a[1]) / d[1]
+    elif d[1] < 0:
+        ty = (0.0 - a[1]) / d[1]
+    else:
+        ty = float("inf")
+
+    t = min(1.0, tx, ty)
+    t = float(np.clip(t, 0.0, 1.0))
+    out = a + d * t
+    return np.clip(out, 0.0, 1.0)
+
+
+def project_points_unit_square(anchor_xy: np.ndarray, delta_xy: np.ndarray) -> np.ndarray:
+    """Vectorized direction-preserving projection for many points.
+
+    anchor_xy: (N,2) in [0,1]
+    delta_xy: (N,2) unconstrained
+    returns end_xy: (N,2) in [0,1]
+    """
+    a = np.asarray(anchor_xy, dtype=np.float32)
+    d = np.asarray(delta_xy, dtype=np.float32)
+
+    ax = a[:, 0]
+    ay = a[:, 1]
+    dx = d[:, 0]
+    dy = d[:, 1]
+
+    tx = np.where(dx > 0, (1.0 - ax) / dx, np.where(dx < 0, (0.0 - ax) / dx, np.inf))
+    ty = np.where(dy > 0, (1.0 - ay) / dy, np.where(dy < 0, (0.0 - ay) / dy, np.inf))
+
+    t = np.minimum(1.0, np.minimum(tx, ty))
+    t = np.clip(t, 0.0, 1.0)
+
+    end = a + d * t[:, None]
+    return np.clip(end, 0.0, 1.0)
+
+
+def ensemble_fold_submissions_delta(
+    csv_paths: List[str],
+    weights: List[float],
+    out_csv: str,
+    field_x: float,
+    field_y: float,
+) -> None:
+    """Ensemble in *delta(normalized)* space, then project once and write meters.
+
+    Each fold CSV is expected to include:
+      - game_episode
+      - anchor_x_norm, anchor_y_norm
+      - delta_x_norm,  delta_y_norm   (raw model output; NOT clipped)
+
+    Output CSV will contain only:
+      - game_episode, end_x, end_y   (meters)
+    """
+    if len(csv_paths) == 0:
+        raise ValueError("csv_paths is empty")
+    if len(weights) != len(csv_paths):
+        raise ValueError(f"weights length ({len(weights)}) != csv_paths length ({len(csv_paths)})")
+
+    base = pd.read_csv(csv_paths[0])[["game_episode", "anchor_x_norm", "anchor_y_norm"]].copy()
+    base = base.set_index("game_episode")
+
+    # Weighted sum of deltas
+    sum_w = 0.0
+    sum_dx = None
+    sum_dy = None
+
+    for path, w in zip(csv_paths, weights):
+        df = pd.read_csv(path).set_index("game_episode")
+        dx = df["delta_x_norm"].reindex(base.index).astype(float)
+        dy = df["delta_y_norm"].reindex(base.index).astype(float)
+
+        if sum_dx is None:
+            sum_dx = w * dx
+            sum_dy = w * dy
+        else:
+            sum_dx = sum_dx + w * dx
+            sum_dy = sum_dy + w * dy # type: ignore
+        sum_w += float(w)
+
+    assert sum_dx is not None and sum_dy is not None
+
+    delta_ens = np.stack(
+        [
+            (sum_dx / max(sum_w, 1e-12)).to_numpy(),
+            (sum_dy / max(sum_w, 1e-12)).to_numpy(),
+        ],
+        axis=1,
+    )
+    anchor = np.stack([base["anchor_x_norm"].to_numpy(), base["anchor_y_norm"].to_numpy()], axis=1)
+
+    # One-time projection (direction preserved)
+    end_norm = project_points_unit_square(anchor, delta_ens)
+
+    ens = pd.DataFrame(
+        {
+            "game_episode": base.index.values,
+            "end_x": (end_norm[:, 0] * float(field_x)),
+            "end_y": (end_norm[:, 1] * float(field_y)),
+        }
+    )
+    ens.to_csv(out_csv, index=False)
+
+
 def ensemble_fold_submissions(csv_paths: List[str], weights: List[float], out_csv: str) -> None:
-    """Average fold submission CSVs into one final CSV."""
+    """Backward-compatible absolute-coordinate ensembling (not recommended)."""
     if len(csv_paths) == 0:
         raise ValueError("csv_paths is empty")
     if len(weights) != len(csv_paths):
@@ -731,18 +861,9 @@ def ensemble_fold_submissions(csv_paths: List[str], weights: List[float], out_cs
     sum_y = None
 
     for path, w in zip(csv_paths, weights):
-        w = float(w)
-        df = pd.read_csv(path)[["game_episode", "end_x", "end_y"]].copy().set_index("game_episode")
-
-        # align order
-        if not df.index.equals(base.index):
-            df = df.reindex(base.index)
-            if df.isna().any().any():
-                missing = df[df.isna().any(axis=1)].index[:5].tolist()
-                raise ValueError(f"Fold submission {path!r} missing game_episode keys, e.g. {missing}")
-
-        x = df["end_x"].astype(float)
-        y = df["end_y"].astype(float)
+        df = pd.read_csv(path).set_index("game_episode")
+        x = df["end_x"].reindex(base.index).astype(float)
+        y = df["end_y"].reindex(base.index).astype(float)
 
         if sum_x is None:
             sum_x = w * x
@@ -750,7 +871,7 @@ def ensemble_fold_submissions(csv_paths: List[str], weights: List[float], out_cs
         else:
             sum_x = sum_x + w * x
             sum_y = sum_y + w * y # type: ignore
-        sum_w += w
+        sum_w += float(w)
 
     assert sum_x is not None and sum_y is not None
     ens = pd.DataFrame(
@@ -873,6 +994,18 @@ def main(cfg: DictConfig) -> None:
         fold_splits = [(None, None)]  # type: ignore
         folds_to_run = [0]
 
+
+    # W&B grouping (all folds + ensemble under one group)
+    wandb_base_name = None if cfg.wandb.name in (None, "null") else str(cfg.wandb.name)
+    wandb_group_name: Optional[str] = None
+    if bool(cfg.wandb.enabled):
+        # If user provides wandb.group, respect it; else make a unique group per Hydra run dir
+        if hasattr(cfg.wandb, "group") and cfg.wandb.group not in (None, "null"):
+            wandb_group_name = str(cfg.wandb.group)
+        else:
+            run_dir_tag = Path(os.getcwd()).name
+            wandb_group_name = f"{wandb_base_name or 'exp'}-{run_dir_tag}"
+
     for fold_id in folds_to_run:
         fold_train_games, fold_valid_games = fold_splits[fold_id]  # type: ignore
 
@@ -898,10 +1031,9 @@ def main(cfg: DictConfig) -> None:
         if bool(cfg.wandb.enabled):
             import wandb
 
-            base_name = None if cfg.wandb.name in (None, "null") else str(cfg.wandb.name)
-            run_name = base_name
+            run_name = wandb_base_name
             if n_folds > 1:
-                run_name = f"{base_name}-fold{fold_id:02d}" if base_name is not None else f"fold{fold_id:02d}"
+                run_name = f"{wandb_base_name}-fold{fold_id:02d}" if wandb_base_name is not None else f"fold{fold_id:02d}"
 
             wandb_cfg = OmegaConf.to_container(cfg, resolve=True)  # type: ignore
             try:
@@ -911,11 +1043,18 @@ def main(cfg: DictConfig) -> None:
             except Exception:
                 pass
 
+            wandb_tags = list(cfg.wandb.tags) if cfg.wandb.tags is not None else []
+            if n_folds > 1:
+                wandb_tags = wandb_tags + [f"fold{fold_id:02d}", "kfold"]
+
             wandb_run = wandb.init(
                 project=str(cfg.wandb.project),
                 entity=None if cfg.wandb.entity in (None, "null") else str(cfg.wandb.entity),
                 name=run_name,
-                tags=list(cfg.wandb.tags) if cfg.wandb.tags is not None else None,
+                group=wandb_group_name,
+                job_type=(f"fold{fold_id:02d}" if n_folds > 1 else "train"),
+                reinit=True,
+                tags=wandb_tags if len(wandb_tags) > 0 else None,
                 notes=None if cfg.wandb.notes in (None, "null") else str(cfg.wandb.notes),
                 mode=str(cfg.wandb.mode),  # type: ignore
                 config=wandb_cfg,  # type: ignore
@@ -1204,7 +1343,10 @@ def main(cfg: DictConfig) -> None:
 
         preds_x: List[float] = []
         preds_y: List[float] = []
-
+        anchors_x: List[float] = []
+        anchors_y: List[float] = []
+        deltas_x: List[float] = []
+        deltas_y: List[float] = []
         for _, row in tqdm(submission.iterrows(), total=len(submission), desc="Inference"):
             episode_path = to_absolute_path(str(row["path"]))  # test.csv의 path 컬럼
             num, cat, anchor = build_test_sequence_from_path(
@@ -1219,29 +1361,41 @@ def main(cfg: DictConfig) -> None:
                 pred = model(x_num, x_cat, length).detach().cpu().numpy()[0]  # type: ignore # [2]
 
             # pred is delta in normalized coords (anchor-relative)
-            end_norm = pred + anchor  # absolute normalized end position
-            end_norm = np.clip(end_norm, 0.0, 1.0)
+            delta_norm = pred.astype(np.float32)  # [2], unconstrained
+            end_norm_raw = delta_norm + anchor    # absolute normalized end (may be out of bounds)
+
+            # Direction-preserving projection (apply once per-fold; ensemble will re-project once after averaging deltas)
+            end_norm = project_point_unit_square(anchor, end_norm_raw)
 
             preds_x.append(float(end_norm[0] * field_x))
             preds_y.append(float(end_norm[1] * field_y))
+            anchors_x.append(float(anchor[0]))
+            anchors_y.append(float(anchor[1]))
+            deltas_x.append(float(delta_norm[0]))
+            deltas_y.append(float(delta_norm[1]))
 
         submission["end_x"] = preds_x
         submission["end_y"] = preds_y
 
         out_csv = os.path.abspath(str(fold_submission_name))
-        submission[["game_episode", "end_x", "end_y"]].to_csv(out_csv, index=False)  # fileciteturn2file0L240-L243
+        submission["anchor_x_norm"] = anchors_x
+        submission["anchor_y_norm"] = anchors_y
+        submission["delta_x_norm"] = deltas_x
+        submission["delta_y_norm"] = deltas_y
+
+        submission[["game_episode", "end_x", "end_y", "anchor_x_norm", "anchor_y_norm", "delta_x_norm", "delta_y_norm"]].to_csv(out_csv, index=False)  # fileciteturn2file0L240-L243
         print("Saved:", out_csv)
 
         if wandb_run is not None:
             # 1) best 체크포인트 artifact
             model_art = wandb.Artifact(f"model-{wandb_run.id}", type="model")
             model_art.add_file(str(best_ckpt_path))  # checkpoints/best.ckpt.pt
-            wandb_run.log_artifact(model_art, aliases=["best"]).wait()
+            wandb_run.log_artifact(model_art, aliases=(["best", f"fold{fold_id:02d}"] if n_folds > 1 else ["best"])).wait()
 
             # 2) 제출파일 artifact
             sub_art = wandb.Artifact(f"submission-{wandb_run.id}", type="submission")
             sub_art.add_file(str(out_csv))  # outputs/.../baseline_submit.csv
-            wandb_run.log_artifact(sub_art, aliases=["latest"]).wait()
+            wandb_run.log_artifact(sub_art, aliases=(["latest", f"fold{fold_id:02d}"] if n_folds > 1 else ["latest"])).wait()
 
             wandb_run.finish()
 
@@ -1269,15 +1423,66 @@ def main(cfg: DictConfig) -> None:
                 else:
                     weights.append(1.0 / (float(m) + 1e-6))
 
-        ensemble_fold_submissions(fold_pred_paths, weights, base_out_csv)
+        ensemble_fold_submissions_delta(fold_pred_paths, weights, base_out_csv, field_x=float(field_x), field_y=float(field_y))
         print("Saved ensemble:", base_out_csv)
-    elif n_folds > 1 and fold_to_run != -1:
-        # 단일 fold만 돌린 경우에도 기존 파일명으로 복사해두면 제출이 편함
-        base_out_csv = os.path.abspath(str(cfg.output.submission_name))
-        if len(fold_pred_paths) > 0 and os.path.abspath(fold_pred_paths[0]) != base_out_csv:
-            shutil.copyfile(os.path.abspath(fold_pred_paths[0]), base_out_csv)
-            print("Saved (single-fold copy):", base_out_csv)
 
+        # W&B: log final ensemble submission as an artifact (single run, same group)
+        if bool(cfg.wandb.enabled):
+            import wandb
+
+            ens_name = f"{wandb_base_name}-ensemble" if wandb_base_name is not None else "ensemble"
+            ens_tags = list(cfg.wandb.tags) if cfg.wandb.tags is not None else []
+            ens_tags = ens_tags + ["ensemble", "kfold"]
+
+            ens_cfg = OmegaConf.to_container(cfg, resolve=True)  # type: ignore
+            try:
+                ens_cfg["train"]["n_folds"] = n_folds # type: ignore
+                ens_cfg["train"]["fold"] = -1 # type: ignore
+                ens_cfg["train"]["ensemble"] = ensemble_mode # type: ignore
+            except Exception:
+                pass
+
+            ens_run = wandb.init(
+                project=str(cfg.wandb.project),
+                entity=None if cfg.wandb.entity in (None, "null") else str(cfg.wandb.entity),
+                name=ens_name,
+                group=wandb_group_name,
+                job_type="ensemble",
+                reinit=True,
+                tags=ens_tags if len(ens_tags) > 0 else None,
+                notes=None if cfg.wandb.notes in (None, "null") else str(cfg.wandb.notes),
+                mode=str(cfg.wandb.mode),  # type: ignore
+                config=ens_cfg,  # type: ignore
+            )
+
+            # Small, useful bookkeeping
+            try:
+                ens_run.summary["ensemble/mode"] = ensemble_mode
+                ens_run.summary["ensemble/weights"] = [float(w) for w in weights]
+                ens_run.summary["ensemble/fold_metrics"] = [None if (m is None or (not np.isfinite(float(m)))) else float(m) for m in fold_metrics]
+            except Exception:
+                pass
+
+            ens_art = wandb.Artifact(
+                f"submission-ensemble-{ens_run.id}",
+                type="submission",
+                metadata={
+                    "ensemble_mode": ensemble_mode,
+                    "weights": [float(w) for w in weights],
+                    "fold_pred_paths": [os.path.basename(p) for p in fold_pred_paths],
+                    "fold_metrics": [None if (m is None or (not np.isfinite(float(m)))) else float(m) for m in fold_metrics],
+                },
+            )
+            ens_art.add_file(str(base_out_csv))
+            ens_run.log_artifact(ens_art, aliases=["ensemble", "latest"]).wait()
+            ens_run.finish()
+    elif n_folds > 1 and fold_to_run != -1:
+        # 단일 fold만 돌린 경우에도 최종 제출은 (game_episode,end_x,end_y) 3열만 남겨야 안전함
+        base_out_csv = os.path.abspath(str(cfg.output.submission_name))
+        if len(fold_pred_paths) > 0:
+            df0 = pd.read_csv(os.path.abspath(fold_pred_paths[0]))
+            df0[["game_episode", "end_x", "end_y"]].to_csv(base_out_csv, index=False)
+            print("Saved (single-fold clean):", base_out_csv)
 
 if __name__ == "__main__":
     main()
