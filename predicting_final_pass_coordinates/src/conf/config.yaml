@@ -40,6 +40,10 @@ train:
   batch_size: 64
   epochs: 20
   valid_ratio: 0.2
+  # K-fold (group by game_id) + ensemble
+  n_folds: 5           # 1이면 기존 hold-out, 5면 5-fold
+  fold: -1             # -1이면 전체 fold 실행 후 앙상블, 0~K-1이면 해당 fold만
+  ensemble: weighted    # uniform | weighted (valid_mean_dist 기반 1/(dist) 가중)
   lr: 1e-3
   weight_decay: 1e-2
   grad_clip: 1.0
