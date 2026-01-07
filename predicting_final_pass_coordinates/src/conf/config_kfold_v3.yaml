@@ -1,0 +1,77 @@
+# conf/config_kfold_v3.yaml
+defaults:
+  - _self_
+
+task: kfold_train_and_ensemble
+
+data:
+  train_path: data/train.csv
+  test_meta_path: data/test.csv
+  sample_submission_path: data/sample_submission.csv
+  field_x: 105.0
+  field_y: 68.0
+  max_tail_k: 0
+  target_policy: all_pass
+  dt_clip_sec: 60.0
+  dt_norm_ref_sec: 60.0
+
+model:
+  hidden_dim: 128
+  num_layers: 2
+  dropout: 0.1
+  bidirectional: false
+  emb_dims:
+    player_id: 16
+    team_id: 8
+    type_name: 8
+    result_name: 4
+  emb_dropout: 0.1
+
+train:
+  seed: 42
+  device: auto
+  optimizer: adamw
+  batch_size: 64
+  epochs: 20
+  valid_ratio: 0.2         # n_folds<=1 fallback에서만 사용
+  lr: 1e-3
+  weight_decay: 1e-2
+  grad_clip: 1.0
+  amp: true
+  num_workers: 2
+  pin_memory: true
+  log_every_steps: 50
+  resume_path: null
+  two_stage: true
+  stage2:
+    epochs: 10
+    lr: 3e-4
+    max_tail_k: 64
+
+  # ---- K-fold ----
+  n_folds: 5         # K
+  fold: -1           # -1: all folds, else [0..K-1]
+  ensemble: true     # fold==-1일 때, K개 fold 예측을 모아 앙상블 제출 생성
+  ensemble_delta_space: atanh   # atanh(pre-tanh/logit) | mean(tanh 이후 delta 평균)
+
+output:
+  pretrain_ckpt_name: pretrain.best.ckpt.pt
+  ckpt_name: best.ckpt.pt
+  submission_name: baseline_submit.csv
+  ensemble_submission_name: ensemble_submit.csv
+
+wandb:
+  enabled: true
+  project: episode-lstm
+  entity: null
+  name: null
+  group: null         # null이면 같은 hydra run dir 기준으로 자동 생성
+  tags: []
+  notes: null
+  mode: online        # online | offline | disabled
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true
