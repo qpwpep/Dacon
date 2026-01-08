@@ -59,6 +59,9 @@ output:
   ckpt_name: best.ckpt.pt
   submission_name: baseline_submit.csv
   ensemble_submission_name: ensemble_submit.csv
+  episode_cache_dir: cache/episodes_kfold_v3
+  episode_cache_enabled: true
+  episode_cache_compress: true
 
 wandb:
   enabled: true

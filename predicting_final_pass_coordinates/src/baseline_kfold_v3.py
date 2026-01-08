@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import os
 import shutil
+import hashlib
+import pickle
+import gzip
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Optional, Any, Dict
 
@@ -510,6 +514,202 @@ def collate_fn(batch):
     return padded_num, padded_cat, lengths, tgts
 
 
+
+# -------------------------
+# Episode cache (stage-wise)
+# -------------------------
+@dataclass
+class EpisodePack:
+    episodes_num: List[np.ndarray]
+    episodes_cat: List[np.ndarray]
+    targets: List[np.ndarray]
+    episode_game_ids: List[int]
+    episode_keys: List[str]
+    meta: Dict[str, Any]
+
+
+def _get_cfg_param(stage_cfg: Any, key: str, fallback: Any) -> Any:
+    """stage_cfg(DictConfig/dict/None)에서 값을 안전하게 꺼내기."""
+    try:
+        if stage_cfg is not None and (key in stage_cfg) and stage_cfg[key] is not None:
+            return stage_cfg[key]
+    except Exception:
+        pass
+    return fallback
+
+
+def _train_csv_fingerprint(train_csv_path: str) -> str:
+    st = os.stat(train_csv_path)
+    return f"{st.st_size}-{int(st.st_mtime)}"
+
+
+def _episode_cache_path(
+    cfg: DictConfig,
+    train_csv_path: str,
+    target_policy: str,
+    max_tail_k: int,
+    field_x: float,
+    field_y: float,
+    dt_clip_sec: float,
+    dt_norm_ref_sec: float,
+) -> Tuple[Path, Dict[str, Any], bool]:
+    """캐시 파일 경로 + 검증용 meta + compress 여부 반환."""
+    cache_enabled = bool(getattr(cfg.output, "episode_cache_enabled", True))
+    compress = bool(getattr(cfg.output, "episode_cache_compress", True))
+    cache_dir_cfg = str(getattr(cfg.output, "episode_cache_dir", "cache/episodes_kfold_v3"))
+    cache_dir = Path(to_absolute_path(cache_dir_cfg))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    fp = _train_csv_fingerprint(train_csv_path)
+
+    # 파일명은 너무 길어지지 않도록 해시로 축약
+    raw_key = f"{Path(train_csv_path).name}|{fp}|{target_policy}|tail{max_tail_k}|fx{field_x}|fy{field_y}|dt{dt_clip_sec}|norm{dt_norm_ref_sec}"
+    h = hashlib.sha1(raw_key.encode("utf-8")).hexdigest()[:12]
+    fname = f"episodes_{h}_{target_policy}_tail{max_tail_k}.pkl"
+    if compress:
+        fname += ".gz"
+
+    meta = {
+        "train_csv": os.path.abspath(train_csv_path),
+        "train_fp": fp,
+        "target_policy": str(target_policy),
+        "max_tail_k": int(max_tail_k),
+        "field_x": float(field_x),
+        "field_y": float(field_y),
+        "dt_clip_sec": float(dt_clip_sec),
+        "dt_norm_ref_sec": float(dt_norm_ref_sec),
+        "format_version": 1,
+    }
+    return (cache_dir / fname), meta, (cache_enabled and True)
+
+
+def _load_pickle(path: Path) -> Any:
+    if str(path).endswith(".gz"):
+        with gzip.open(path, "rb") as f:
+            return pickle.load(f)
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def _save_pickle(path: Path, obj: Any) -> None:
+    tmp = Path(str(path) + ".tmp")
+    if str(path).endswith(".gz"):
+        with gzip.open(tmp, "wb") as f:
+            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+    else:
+        with open(tmp, "wb") as f:
+            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(path)
+
+
+def get_or_build_stage_episodes(
+    cfg: DictConfig,
+    *,
+    train_csv_path: str,
+    vocabs: dict,
+    target_policy: str,
+    max_tail_k: int,
+    field_x: float,
+    field_y: float,
+    dt_clip_sec: float,
+    dt_norm_ref_sec: float,
+) -> EpisodePack:
+    """(stage_policy, max_tail_k) 조합에 대한 에피소드 생성 + 디스크 캐시."""
+    cache_path, meta, cache_enabled = _episode_cache_path(
+        cfg=cfg,
+        train_csv_path=train_csv_path,
+        target_policy=target_policy,
+        max_tail_k=max_tail_k,
+        field_x=field_x,
+        field_y=field_y,
+        dt_clip_sec=dt_clip_sec,
+        dt_norm_ref_sec=dt_norm_ref_sec,
+    )
+
+    if cache_enabled and cache_path.exists():
+        try:
+            pack = _load_pickle(cache_path)
+            if isinstance(pack, dict):
+                pack = EpisodePack(**pack)
+            # meta 검증 (핵심만)
+            if isinstance(pack, EpisodePack) and pack.meta.get("train_fp") == meta["train_fp"] and pack.meta.get(
+                "target_policy"
+            ) == meta["target_policy"] and int(pack.meta.get("max_tail_k")) == meta["max_tail_k"]:
+                print(f"[cache] load stage episodes: {cache_path} (episodes={len(pack.episodes_num)})")
+                return pack
+            else:
+                print(f"[cache] stale/mismatch -> rebuild: {cache_path}")
+        except Exception as e:
+            print(f"[cache] failed to load -> rebuild: {cache_path} (err={e})")
+
+    episodes_num, episodes_cat, targets, episode_game_ids, episode_keys = build_train_episodes(
+        train_csv_path=train_csv_path,
+        field_x=field_x,
+        field_y=field_y,
+        vocabs=vocabs,
+        max_tail_k=max_tail_k,
+        target_policy=target_policy,
+        dt_clip_sec=dt_clip_sec,
+        dt_norm_ref_sec=dt_norm_ref_sec,
+    )
+
+    pack = EpisodePack(
+        episodes_num=episodes_num,
+        episodes_cat=episodes_cat,
+        targets=targets,
+        episode_game_ids=episode_game_ids,
+        episode_keys=episode_keys,
+        meta=meta,
+    )
+
+    if cache_enabled:
+        _save_pickle(cache_path, pack.__dict__)
+        print(f"[cache] save stage episodes: {cache_path} (episodes={len(episodes_num)})")
+    return pack
+
+
+def prepare_required_stage_episodes(cfg: DictConfig, *, train_csv_path: str, vocabs: dict) -> Dict[Tuple[str, int], EpisodePack]:
+    """현재 config에서 필요한 stage 조합들을 1회만 생성/로드해서 dict로 반환."""
+    field_x = float(cfg.data.field_x)
+    field_y = float(cfg.data.field_y)
+    dt_clip_sec = float(getattr(cfg.data, "dt_clip_sec", 60.0))
+    dt_norm_ref_sec = float(getattr(cfg.data, "dt_norm_ref_sec", 60.0))
+
+    target_policy = str(getattr(cfg.data, "target_policy", "all_pass")).strip()
+    two_stage = bool(getattr(cfg.train, "two_stage", False))
+    resume_path = str(getattr(cfg.train, "resume_path", "") or "").strip()
+    stage2_cfg = cfg.train.stage2 if ("stage2" in cfg.train) else None
+
+    # run_one_fold와 동일한 stage 정의 규칙
+    stages: List[Tuple[str, str, Any]] = []
+    if two_stage:
+        if resume_path:
+            stages = [("finetune", "last_pass", stage2_cfg)]
+        else:
+            stages = [("pretrain", "all_pass", cfg.train), ("finetune", "last_pass", stage2_cfg)]
+    else:
+        stages = [("train", target_policy, cfg.train)]
+
+    required: Dict[Tuple[str, int], EpisodePack] = {}
+    for _, stage_policy, stage_cfg in stages:
+        max_tail_k = int(_get_cfg_param(stage_cfg, "max_tail_k", getattr(cfg.data, "max_tail_k", 0)))
+        key = (str(stage_policy).strip().lower(), int(max_tail_k))
+        if key in required:
+            continue
+        required[key] = get_or_build_stage_episodes(
+            cfg,
+            train_csv_path=train_csv_path,
+            vocabs=vocabs,
+            target_policy=key[0],
+            max_tail_k=key[1],
+            field_x=field_x,
+            field_y=field_y,
+            dt_clip_sec=dt_clip_sec,
+            dt_norm_ref_sec=dt_norm_ref_sec,
+        )
+    return required
+
+
 # -------------------------
 # Model
 # -------------------------
@@ -861,6 +1061,7 @@ def run_one_fold(
     vocabs: dict,
     vocab_sizes: dict,
     base_group: Optional[str],
+    stage_episode_packs: Optional[Dict[Tuple[str, int], EpisodePack]] = None,
 ) -> Dict[str, str]:
     """
     Returns dict:
@@ -945,16 +1146,30 @@ def run_one_fold(
         stage_log_every = int(get_stage_param(stage_cfg, "log_every_steps", cfg.train.log_every_steps))
         stage_max_tail_k = int(get_stage_param(stage_cfg, "max_tail_k", getattr(cfg.data, "max_tail_k", 0)))
 
-        # Build episodes for this stage
-        episodes_num, episodes_cat, targets, episode_game_ids, episode_keys = build_train_episodes(
-            train_csv_path=train_path,
-            field_x=field_x,
-            field_y=field_y,
-            vocabs=vocabs,
-            max_tail_k=stage_max_tail_k,
-            target_policy=stage_policy,
-            dt_clip_sec=dt_clip_sec,
-            dt_norm_ref_sec=dt_norm_ref_sec,
+        # Build/load episodes for this stage (stage-wise cache, build only once per (policy, tail_k))
+        stage_key = (str(stage_policy).strip().lower(), int(stage_max_tail_k))
+        if stage_episode_packs is None:
+            stage_episode_packs = {}
+        if stage_key not in stage_episode_packs:
+            stage_episode_packs[stage_key] = get_or_build_stage_episodes(
+                cfg,
+                train_csv_path=train_path,
+                vocabs=vocabs,
+                target_policy=stage_key[0],
+                max_tail_k=stage_key[1],
+                field_x=field_x,
+                field_y=field_y,
+                dt_clip_sec=dt_clip_sec,
+                dt_norm_ref_sec=dt_norm_ref_sec,
+            )
+
+        pack = stage_episode_packs[stage_key]
+        episodes_num, episodes_cat, targets, episode_game_ids, episode_keys = (
+            pack.episodes_num,
+            pack.episodes_cat,
+            pack.targets,
+            pack.episode_game_ids,
+            pack.episode_keys,
         )
 
         assert len(episodes_num) > 0, "No training episodes were built. Check data & target_policy."
@@ -1228,6 +1443,9 @@ def main(cfg: DictConfig) -> None:
     # Build vocab once
     vocabs, vocab_sizes = build_vocabs(train_path)
 
+    # Precompute/load stage-wise episodes once (shared across all folds in this run)
+    stage_episode_packs = prepare_required_stage_episodes(cfg, train_csv_path=train_path, vocabs=vocabs)
+
     n_folds = int(getattr(cfg.train, "n_folds", 1))
     fold = int(getattr(cfg.train, "fold", -1))
     do_ensemble = bool(getattr(cfg.train, "ensemble", False))
@@ -1250,7 +1468,7 @@ def main(cfg: DictConfig) -> None:
     results = []
     pred_paths = []
     for fidx in folds_to_run:
-        res = run_one_fold(cfg=cfg, fold_idx=fidx, vocabs=vocabs, vocab_sizes=vocab_sizes, base_group=base_group)
+        res = run_one_fold(cfg=cfg, fold_idx=fidx, vocabs=vocabs, vocab_sizes=vocab_sizes, base_group=base_group, stage_episode_packs=stage_episode_packs)
         results.append(res)
         pred_paths.append(res["fold_pred_delta_csv"])
 

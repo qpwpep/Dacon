@@ -700,6 +700,7 @@ output*
 baseline.ipynb
 /test
 *.csv
+/cache
 
 # wandb
 /wandb
