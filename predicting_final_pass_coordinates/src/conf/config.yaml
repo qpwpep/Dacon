@@ -1,8 +1,8 @@
-# conf/config.yaml
+# conf/config_kfold_v3.yaml
 defaults:
   - _self_
 
-task: train_and_predict
+task: kfold_train_and_ensemble
 
 data:
   train_path: data/train.csv
@@ -10,22 +10,16 @@ data:
   sample_submission_path: data/sample_submission.csv
   field_x: 105.0
   field_y: 68.0
-  # 0이면 전체 시퀀스 사용, 예: 64면 마지막 64개 action만 사용(노이즈 줄이기에 유리)
   max_tail_k: 0
-  # 학습 타깃 샘플 정책
-  # - all_pass: 에피소드 내 모든 Pass를 학습 샘플로 사용 (pretrain에 적합)
-  # - last_pass: 에피소드 마지막 Pass 1개만 사용 (test 분포 정합/finetune에 적합)
-  target_policy: all_pass     # all_pass | last_pass
-  dt_clip_sec: 60.0           # dt(time_seconds 차이) 클리핑 상한(초). 중단/재개 등으로 큰 dt가 생길 때 학습 안정화.
-  dt_norm_ref_sec: 60.0       # dt 정규화 기준(초). dt = log1p(clip(dt))/log1p(dt_norm_ref_sec)
+  target_policy: all_pass
+  dt_clip_sec: 60.0
+  dt_norm_ref_sec: 60.0
 
 model:
-  # numeric feature dim은 코드에서 자동 추론(현재 기본 17)
   hidden_dim: 128
   num_layers: 2
   dropout: 0.1
-  bidirectional: false
-  # categorical embedding dims
+  bidirectional: true
   emb_dims:
     player_id: 16
     team_id: 8
@@ -35,16 +29,11 @@ model:
 
 train:
   seed: 42
-  device: auto            # auto | cpu | cuda
-  optimizer: adamw        # adamw | adam
+  device: auto
+  optimizer: adamw
   batch_size: 64
   epochs: 20
-  valid_ratio: 0.2
-  # K-fold (group by game_id) + ensemble
-  n_folds: 5           # 1이면 기존 hold-out, 5면 5-fold
-  fold: -1             # -1이면 전체 fold 실행 후 앙상블, 0~K-1이면 해당 fold만
-  ensemble: uniform    # uniform | weighted (valid_mean_dist 기반 1/(dist) 가중)
-  ensemble_space: logit   # tanh | logit
+  valid_ratio: 0.2         # n_folds<=1 fallback에서만 사용
   lr: 1e-3
   weight_decay: 1e-2
   grad_clip: 1.0
@@ -52,30 +41,41 @@ train:
   num_workers: 2
   pin_memory: true
   log_every_steps: 50
-  # 체크포인트로부터 가중치 초기화/재개 (2-stage에서 finetune 시작점으로도 사용)
   resume_path: null
-  # true면 pretrain(all_pass) -> finetune(last_pass) 순서로 자동 실행
+  dump_valid_errors_dir: outputs/valid_error_dumps
   two_stage: true
-  # finetune(stage2) 설정 (없는 값은 train 기본값을 그대로 사용)
   stage2:
     epochs: 10
     lr: 3e-4
     max_tail_k: 64
 
+  # ---- K-fold ----
+  n_folds: 5         # K
+  fold: -1           # -1: all folds, else [0..K-1]
+  ensemble: true     # fold==-1일 때, K개 fold 예측을 모아 앙상블 제출 생성
+  ensemble_delta_space: atanh   # atanh(pre-tanh/logit) | mean(tanh 이후 delta 평균)
+  ensemble_trim_k: 1            # trimmed mean: 양끝 trim_k개 제거 후 평균 (K=5면 1, K=7이면 2 추천)
+
 output:
   pretrain_ckpt_name: pretrain.best.ckpt.pt
   ckpt_name: best.ckpt.pt
   submission_name: baseline_submit.csv
+  ensemble_submission_name: ensemble_submit.csv
+  episode_cache_dir: cache/episodes_kfold_v3
+  episode_cache_enabled: true
+  episode_cache_compress: true
+  dump_valid_errors: true
+  dump_valid_errors_dir: outputs/valid_error_dumps
 
 wandb:
   enabled: true
   project: episode-lstm
   entity: null
-  group: null        # 그룹 이름(지정하면 그대로 사용). null이면 Hydra run dir 기반 자동 생성
   name: null
+  group: null         # null이면 같은 hydra run dir 기준으로 자동 생성
   tags: []
   notes: null
-  mode: online          # online | offline | disabled
+  mode: online        # online | offline | disabled
 
 hydra:
   run:

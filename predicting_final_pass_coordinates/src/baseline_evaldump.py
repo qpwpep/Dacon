@@ -778,21 +778,99 @@ class LSTMWithEmb(nn.Module):
 def evaluate(
     model: nn.Module,
     loader: DataLoader,
-    device: str,
+    device: torch.device,
     field_x: float,
     field_y: float,
+    *,
+    dump_path: Optional[str] = None,
+    keys: Optional[List[str]] = None,
+    fold_idx: Optional[int] = None,
+    stage_name: str = "unknown",
+    split_name: str = "valid",
+    global_epoch: Optional[int] = None,
 ) -> float:
+    """
+    Returns mean prediction error distance (meters) over `loader`.
+    If dump_path is given, also dumps per-sample rows to CSV for later diagnostics/joining.
+    NOTE: `keys` must align with the dataset order in `loader` (valid_loader should be shuffle=False).
+    """
     model.eval()
     total = 0.0
     n = 0
 
-    for X_num, X_cat, lengths, y in tqdm(loader, desc="Valid", leave=False):
+    do_dump = dump_path is not None
+    if do_dump and keys is None:
+        raise ValueError("evaluate(dump_path=...) requires keys=... (aligned with loader order).")
+
+    rows: List[Dict[str, Any]] = []
+    key_ptr = 0
+
+    for batch in tqdm(loader, desc=f"{split_name.title()}", leave=False):
+        X_num, X_cat, lengths, y = batch
         X_num, X_cat, lengths, y = X_num.to(device), X_cat.to(device), lengths.to(device), y.to(device)
+
         pred = model(X_num, X_cat, lengths)
-        dist = euclidean_loss_meters(pred, y, field_x=field_x, field_y=field_y)
-        bs = X_num.size(0)
-        total += float(dist.item()) * bs
+
+        # Per-sample error in meters
+        err_dx_m = (pred[:, 0] - y[:, 0]) * field_x
+        err_dy_m = (pred[:, 1] - y[:, 1]) * field_y
+        err_dist_m = torch.sqrt(err_dx_m * err_dx_m + err_dy_m * err_dy_m + 1e-12)
+
+        bs = int(y.size(0))
+        total += float(err_dist_m.mean().item()) * bs
         n += bs
+
+        if do_dump:
+            assert keys is not None
+            batch_keys = keys[key_ptr : key_ptr + bs]
+            if len(batch_keys) != bs:
+                raise ValueError(
+                    f"keys length mismatch: need {key_ptr+bs} keys but got only {len(keys)} total. "
+                    "Make sure valid_keys aligns with valid_loader order."
+                )
+            key_ptr += bs
+
+            # Target delta magnitude in meters (same definition as A/B/C scripts)
+            tgt_dx_m = y[:, 0] * field_x
+            tgt_dy_m = y[:, 1] * field_y
+            tgt_dist_m = torch.sqrt(tgt_dx_m * tgt_dx_m + tgt_dy_m * tgt_dy_m + 1e-12)
+            tgt_sat95 = (y[:, 0].abs() > 0.95) | (y[:, 1].abs() > 0.95)
+
+            lengths_cpu = lengths.detach().cpu().numpy().astype(int)
+
+            pred_cpu = pred.detach().cpu().numpy()
+            y_cpu = y.detach().cpu().numpy()
+            err_cpu = err_dist_m.detach().cpu().numpy()
+            tgt_dist_cpu = tgt_dist_m.detach().cpu().numpy()
+            tgt_sat95_cpu = tgt_sat95.detach().cpu().numpy().astype(bool)
+
+            for i in range(bs):
+                rows.append(
+                    {
+                        "fold": int(fold_idx) if fold_idx is not None else -1,
+                        "stage": str(stage_name),
+                        "split": str(split_name),
+                        "epoch": int(global_epoch) if global_epoch is not None else -1,
+                        "idx_in_split": int(key_ptr - bs + i),
+                        "game_episode": str(batch_keys[i]),
+                        "seq_len": int(lengths_cpu[i]),
+                        # normalized deltas (model space)
+                        "pred_x_norm": float(pred_cpu[i, 0]),
+                        "pred_y_norm": float(pred_cpu[i, 1]),
+                        "tgt_x_norm": float(y_cpu[i, 0]),
+                        "tgt_y_norm": float(y_cpu[i, 1]),
+                        # error / target stats (meters)
+                        "err_dist_m": float(err_cpu[i]),
+                        "tgt_dist_m": float(tgt_dist_cpu[i]),
+                        "tgt_sat95": bool(tgt_sat95_cpu[i]),
+                    }
+                )
+
+    if do_dump:
+        out_p = Path(str(dump_path))
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_csv(out_p, index=False)
+        print(f"[eval-dump] saved per-sample errors -> {out_p} (rows={len(rows)})")
 
     return total / max(n, 1)
 
@@ -962,7 +1040,6 @@ def delta_ensemble(
     field_x: float,
     field_y: float,
     delta_space: str = "atanh",
-    trim_k: int = 0,
     eps: float = 1e-6,
 ) -> pd.DataFrame:
     """
@@ -970,9 +1047,6 @@ def delta_ensemble(
     delta_space:
       - "mean": tanh 이후 delta 공간에서 단순 평균
       - "atanh": tanh 이전(pre-tanh, logit-like) 공간에서 평균: atanh(delta) -> mean -> tanh
-    trim_k:
-      - 0이면 기존 mean과 동일
-      - >0이면 fold축(K)에서 dx/dy 각각 정렬 후 양끝 trim_k개 제거하고 평균 (trimmed mean)
     """
     if len(dfs) == 0:
         raise ValueError("No fold prediction dfs provided.")
@@ -996,24 +1070,14 @@ def delta_ensemble(
 
     D = np.stack(deltas, axis=0)  # [K, N, 2]
 
-    def _trimmed_mean(X: np.ndarray, k: int) -> np.ndarray:
-        # X: [K, N, 2]
-        if k <= 0:
-            return X.mean(axis=0)
-        K = int(X.shape[0])
-        if 2 * k >= K:
-            raise ValueError(f"trim_k too large: trim_k={k} with K={K} (need 2*trim_k < K).")
-        Xs = np.sort(X, axis=0)           # fold축 정렬 (dx/dy 각각 independently)
-        return Xs[k:K - k].mean(axis=0)   # [N, 2]
-
     space = str(delta_space).strip().lower()
     if space in ("atanh", "logit", "pre_tanh", "pretanh"):
         D_clip = np.clip(D, -1.0 + eps, 1.0 - eps)
         Z = np.arctanh(D_clip)  # inverse tanh
-        Zm = _trimmed_mean(Z, int(trim_k))
+        Zm = Z.mean(axis=0)
         Dm = np.tanh(Zm)
     elif space in ("mean", "tanh", "raw"):
-        Dm = _trimmed_mean(D, int(trim_k))
+        Dm = D.mean(axis=0)
     else:
         raise ValueError(f"Unknown delta_space={delta_space!r}. Use 'atanh' or 'mean'.")
 
@@ -1216,6 +1280,9 @@ def run_one_fold(
         targets_valid = [targets[i] for i in idx_valid]
         print(f"[fold {fold_idx}] train episodes:", len(episodes_num_train), "valid episodes:", len(episodes_num_valid))
 
+        train_keys: Optional[List[str]] = None
+        valid_keys: Optional[List[str]] = None
+
         # Sanity check: last_pass duplicates
         if str(stage_policy).strip().lower() == "last_pass":
             total_all = len(episode_keys)
@@ -1368,6 +1435,31 @@ def run_one_fold(
         model.eval()
         print(f"[fold {fold_idx}] [{stage_name}] Loaded best checkpoint: epoch={ckpt_best.get('epoch')} best_metric={ckpt_best.get('best_metric')}")
 
+        # Optional: dump per-sample VALID errors for later analysis (join with A/B/C bin tables)
+        dump_valid_errors = bool(getattr(cfg.output, "dump_valid_errors", False))
+        dump_dir = str(getattr(cfg.output, "valid_error_dump_dir", "valid_error_dumps") or "").strip()
+        if dump_valid_errors and dump_dir and str(stage_policy).strip().lower() == "last_pass":
+            # Typically you only need finetune dumps; keep it explicit to avoid surprises.
+            if str(stage_name).strip().lower() in ("finetune", "train"):
+                vkeys = valid_keys  # may be None if not last_pass (guarded above)
+                if vkeys is None:
+                    print(f"[fold {fold_idx}] [warn] dump_valid_errors requested but valid_keys is None (skip).")
+                else:
+                    out_p = Path(dump_dir) / f"errors_{stage_name}_fold{fold_idx}.csv"
+                    _ = evaluate(
+                        model,
+                        valid_loader,
+                        device,
+                        field_x=field_x,
+                        field_y=field_y,
+                        dump_path=str(out_p),
+                        keys=vkeys,
+                        fold_idx=fold_idx,
+                        stage_name=str(stage_name),
+                        split_name="valid",
+                        global_epoch=int(ckpt_best.get("epoch", -1)),
+                    )
+
         final_best_ckpt_path = best_ckpt_path
         epoch_offset += stage_epochs
 
@@ -1464,7 +1556,6 @@ def main(cfg: DictConfig) -> None:
     fold = int(getattr(cfg.train, "fold", -1))
     do_ensemble = bool(getattr(cfg.train, "ensemble", False))
     delta_space = str(getattr(cfg.train, "ensemble_delta_space", "atanh")).strip().lower()
-    trim_k = int(getattr(cfg.train, "ensemble_trim_k", 0))
 
     # W&B group name (한 run 내부에서 fold들을 묶기)
     group_cfg = getattr(cfg.wandb, "group", None)
@@ -1493,13 +1584,7 @@ def main(cfg: DictConfig) -> None:
         field_y = float(cfg.data.field_y)
 
         dfs = [pd.read_csv(p) for p in pred_paths]
-        ens_df = delta_ensemble(
-            dfs,
-            field_x=field_x,
-            field_y=field_y,
-            delta_space=delta_space,
-            trim_k=trim_k,
-        )
+        ens_df = delta_ensemble(dfs, field_x=field_x, field_y=field_y, delta_space=delta_space)
 
         ens_name = str(getattr(cfg.output, "ensemble_submission_name", "ensemble_submit.csv"))
         ens_path = os.path.abspath(ens_name)
@@ -1512,7 +1597,7 @@ def main(cfg: DictConfig) -> None:
             name=(None if cfg.wandb.name in (None, "null") else f"{str(cfg.wandb.name)}-ensemble"),
             group=base_group,
             job_type="ensemble",
-            extra_config={"delta_space": delta_space, "trim_k": trim_k, "n_folds": n_folds},
+            extra_config={"delta_space": delta_space, "n_folds": n_folds},
         )
         if wandb_run is not None:
             # bundle all fold pred files into one artifact for traceability

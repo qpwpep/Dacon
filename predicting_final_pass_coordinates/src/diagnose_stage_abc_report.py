@@ -1,3 +1,4 @@
+# src/diagnose_stage_abc_report.py
 from __future__ import annotations
 
 import os
@@ -487,10 +488,19 @@ def build_test_sequence_from_path(
 
 
 class EpisodeDataset(Dataset):
-    def __init__(self, episodes_num: List[np.ndarray], episodes_cat: List[np.ndarray], targets: List[np.ndarray]):
+    def __init__(
+        self,
+        episodes_num: List[np.ndarray],
+        episodes_cat: List[np.ndarray],
+        targets: List[np.ndarray],
+        episode_game_ids: Optional[List[int]] = None,
+        episode_keys: Optional[List[str]] = None,
+    ):
         self.episodes_num = episodes_num
         self.episodes_cat = episodes_cat
         self.targets = targets
+        self.episode_game_ids = episode_game_ids
+        self.episode_keys = episode_keys
 
     def __len__(self) -> int:
         return len(self.episodes_num)
@@ -500,18 +510,32 @@ class EpisodeDataset(Dataset):
         cat = torch.tensor(self.episodes_cat[idx], dtype=torch.long)  # [T, 4]
         tgt = torch.tensor(self.targets[idx], dtype=torch.float32)  # [2]
         length = num.size(0)
-        return num, cat, length, tgt
+        if self.episode_game_ids is None or self.episode_keys is None:
+            return num, cat, length, tgt
+        gid = int(self.episode_game_ids[idx])
+        ekey = str(self.episode_keys[idx])
+        return num, cat, length, tgt, gid, ekey
 
 
 def collate_fn(batch):
-    nums, cats, lengths, tgts = zip(*batch)
-    lengths = torch.tensor(lengths, dtype=torch.long)
+    # support (num, cat, length, tgt) OR (num, cat, length, tgt, game_id, episode_key)
+    if len(batch[0]) == 4:
+        nums, cats, lengths, tgts = zip(*batch)
+        gids = None
+        keys = None
+    else:
+        nums, cats, lengths, tgts, gids, keys = zip(*batch)
 
+    lengths = torch.tensor(lengths, dtype=torch.long)
     padded_num = pad_sequence(nums, batch_first=True)  # type: ignore
     padded_cat = pad_sequence(cats, batch_first=True)  # type: ignore
-
     tgts = torch.stack(tgts, dim=0)  # [B, 2]
-    return padded_num, padded_cat, lengths, tgts
+
+    if gids is None or keys is None:
+        return padded_num, padded_cat, lengths, tgts
+    gids = torch.tensor(gids, dtype=torch.long)
+    keys = list(keys)
+    return padded_num, padded_cat, lengths, tgts, gids, keys
 
 
 
@@ -634,7 +658,7 @@ def get_or_build_stage_episodes(
             # meta 검증 (핵심만)
             if isinstance(pack, EpisodePack) and pack.meta.get("train_fp") == meta["train_fp"] and pack.meta.get(
                 "target_policy"
-            ) == meta["target_policy"] and int(pack.meta.get("max_tail_k")) == meta["max_tail_k"]:
+            ) == meta["target_policy"] and int(pack.meta.get("max_tail_k")) == meta["max_tail_k"]: # type: ignore
                 print(f"[cache] load stage episodes: {cache_path} (episodes={len(pack.episodes_num)})")
                 return pack
             else:
@@ -781,20 +805,82 @@ def evaluate(
     device: str,
     field_x: float,
     field_y: float,
+    dump_csv_path: Optional[str] = None,
+    dump_fold: Optional[int] = None,
+    dump_stage: str = "finetune",
+    dump_split: str = "valid",
 ) -> float:
     model.eval()
     total = 0.0
     n = 0
+    rows: List[Dict[str, Any]] = []
 
-    for X_num, X_cat, lengths, y in tqdm(loader, desc="Valid", leave=False):
+    for batch in tqdm(loader, desc="Valid", leave=False):
+        X_num, X_cat, lengths, y = batch[:4]
+        gids = None
+        keys = None
+        if len(batch) == 6:
+            gids, keys = batch[4], batch[5]
+
         X_num, X_cat, lengths, y = X_num.to(device), X_cat.to(device), lengths.to(device), y.to(device)
-        pred = model(X_num, X_cat, lengths)
-        dist = euclidean_loss_meters(pred, y, field_x=field_x, field_y=field_y)
+        with torch.no_grad():
+            pred = model(X_num, X_cat, lengths)
+
+        # per-sample error dist (meters)
+        err_dx_m = (pred[:, 0] - y[:, 0]) * field_x
+        err_dy_m = (pred[:, 1] - y[:, 1]) * field_y
+        err_dist_m = torch.sqrt(err_dx_m * err_dx_m + err_dy_m * err_dy_m + 1e-9)  # [B]
+
         bs = X_num.size(0)
-        total += float(dist.item()) * bs
+        total += float(err_dist_m.mean().item()) * bs
         n += bs
 
-    return total / max(n, 1)
+        if dump_csv_path is not None and gids is not None and keys is not None:
+            gids_list = gids.cpu().tolist()
+            # true target stats (meters)
+            tgt_dx_norm = y[:, 0].detach().cpu().numpy()
+            tgt_dy_norm = y[:, 1].detach().cpu().numpy()
+            tgt_dx_m = tgt_dx_norm * field_x
+            tgt_dy_m = tgt_dy_norm * field_y
+            tgt_dist = np.sqrt(tgt_dx_m * tgt_dx_m + tgt_dy_m * tgt_dy_m)
+            sat95 = (np.abs(tgt_dx_norm) > 0.95) | (np.abs(tgt_dy_norm) > 0.95)
+
+            pred_dx_norm = pred[:, 0].detach().cpu().numpy()
+            pred_dy_norm = pred[:, 1].detach().cpu().numpy()
+            err_dist = err_dist_m.detach().cpu().numpy()
+            err_dx = err_dx_m.detach().cpu().numpy()
+            err_dy = err_dy_m.detach().cpu().numpy()
+            seq_len = lengths.detach().cpu().numpy()
+
+            for j in range(bs):
+                rows.append(
+                    {
+                        "fold": dump_fold,
+                        "stage": dump_stage,
+                        "split": dump_split,
+                        "game_id": int(gids_list[j]),
+                        "episode_key": str(keys[j]),
+                        "seq_len": int(seq_len[j]),
+                        "tgt_dx_norm": float(tgt_dx_norm[j]),
+                        "tgt_dy_norm": float(tgt_dy_norm[j]),
+                        "tgt_dist_m": float(tgt_dist[j]),
+                        "sat95": bool(sat95[j]),
+                        "pred_dx_norm": float(pred_dx_norm[j]),
+                        "pred_dy_norm": float(pred_dy_norm[j]),
+                        "err_dx_m": float(err_dx[j]),
+                        "err_dy_m": float(err_dy[j]),
+                        "err_dist_m": float(err_dist[j]),
+                    }
+                )
+
+    mean_dist = total / max(n, 1)
+    if dump_csv_path is not None and len(rows) > 0:
+        out_path = Path(dump_csv_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_csv(out_path, index=False)
+        print(f"[dump] saved per-sample valid errors -> {out_path} (n={len(rows)})")
+
+    return mean_dist
 
 
 def train_one_epoch(
@@ -817,7 +903,8 @@ def train_one_epoch(
     use_amp = bool(amp) and str(device).startswith("cuda")
     scaler = GradScaler("cuda", enabled=use_amp)
 
-    for step, (X_num, X_cat, lengths, y) in enumerate(tqdm(loader, desc="Train", leave=False), start=1):
+    for step, batch in enumerate(tqdm(loader, desc="Train", leave=False), start=1):
+        X_num, X_cat, lengths, y = batch[:4]
         X_num, X_cat, lengths, y = X_num.to(device), X_cat.to(device), lengths.to(device), y.to(device)
 
         optimizer.zero_grad(set_to_none=True)
@@ -1233,8 +1320,17 @@ def run_one_fold(
             pin_memory=stage_pin_memory,
             collate_fn=collate_fn,
         )
+        # keep keys/game_ids only for VALID (needed for per-sample dump)
+        episode_game_ids_valid = [episode_game_ids[i] for i in idx_valid]
+        episode_keys_valid = [episode_keys[i] for i in idx_valid]
         valid_loader = DataLoader(
-            EpisodeDataset(episodes_num_valid, episodes_cat_valid, targets_valid),
+            EpisodeDataset(
+                episodes_num_valid,
+                episodes_cat_valid,
+                targets_valid,
+                episode_game_ids=episode_game_ids_valid,
+                episode_keys=episode_keys_valid,
+            ),
             batch_size=stage_batch_size,
             shuffle=False,
             num_workers=stage_num_workers,
@@ -1354,6 +1450,23 @@ def run_one_fold(
         model.eval()
         print(f"[fold {fold_idx}] [{stage_name}] Loaded best checkpoint: epoch={ckpt_best.get('epoch')} best_metric={ckpt_best.get('best_metric')}")
 
+        # dump per-sample VALID errors for BEST ckpt (finetune only)
+        dump_dir = str(getattr(cfg.train, "dump_valid_errors_dir", "") or "")
+        if dump_dir and stage_name == "finetune":
+            dump_dir_abs = Path(to_absolute_path(dump_dir))
+            dump_path = dump_dir_abs / f"fold{fold_idx:02d}_{stage_name}_valid_errors.csv"
+            _ = evaluate(
+                model=model,
+                loader=valid_loader,
+                device=device,
+                field_x=field_x,
+                field_y=field_y,
+                dump_csv_path=str(dump_path),
+                dump_fold=int(fold_idx),
+                dump_stage=str(stage_name),
+                dump_split="valid",
+            )
+
         final_best_ckpt_path = best_ckpt_path
         epoch_offset += stage_epochs
 
@@ -1432,7 +1545,7 @@ def run_one_fold(
 # -------------------------
 # Main (Hydra)
 # -------------------------
-@hydra.main(version_base=None, config_path="conf", config_name="config_kfold_v3")
+@hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig) -> None:
     # Hydra run dir 안에 현재 실험 config 저장 (재현성)
     OmegaConf.save(cfg, "hydra_config_resolved.yaml")
