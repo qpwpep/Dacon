@@ -5,6 +5,7 @@ import shutil
 import hashlib
 import pickle
 import gzip
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Optional, Any, Dict
@@ -18,6 +19,7 @@ from tqdm import tqdm
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence
 from torch.utils.data import Dataset, DataLoader
 from torch.amp.grad_scaler import GradScaler
@@ -518,6 +520,54 @@ def collate_fn(batch):
 # -------------------------
 # Episode cache (stage-wise)
 # -------------------------
+EPISODE_CACHE_FORMAT_VERSION = 2  # <-- meta 스키마 바뀌면 올려주세요 (기존 1 -> 2)
+
+def _sha1_json(obj: Any) -> str:
+    s = json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+def _vocab_sizes_from_vocabs(vocabs: dict) -> Dict[str, int]:
+    # build_vocabs에서 sizes = len(v)+2 규칙을 사용 :contentReference[oaicite:3]{index=3}
+    return {k: int(len(v) + 2) for k, v in vocabs.items()}
+
+def _is_episode_pack_valid(pack: "EpisodePack", expected_meta: Dict[str, Any]) -> Tuple[bool, str]:
+    if not isinstance(pack, EpisodePack):
+        return False, "not EpisodePack"
+
+    m = pack.meta or {}
+
+    # (A) meta 필수키 전체 비교 (strict)
+    for k, v in expected_meta.items():
+        if m.get(k) != v:
+            return False, f"meta mismatch: {k} (cached={m.get(k)!r}, expected={v!r})"
+
+    # (B) 구조/스키마 sanity check
+    n = len(pack.episodes_num)
+    if n == 0:
+        return False, "empty pack"
+
+    if not (len(pack.episodes_cat) == n == len(pack.targets) == len(pack.episode_game_ids) == len(pack.episode_keys)):
+        return False, "length mismatch among episodes_* / targets / ids / keys"
+
+    # feature dims (현재 build_train_episodes num feature는 21개로 고정 :contentReference[oaicite:4]{index=4})
+    exp_num_dim = int(expected_meta.get("num_feature_dim", -1))
+    exp_cat_dim = int(expected_meta.get("cat_feature_dim", -1))
+    exp_tgt_dim = int(expected_meta.get("target_dim", 2))
+
+    num0 = pack.episodes_num[0]
+    cat0 = pack.episodes_cat[0]
+    tgt0 = pack.targets[0]
+
+    if num0.ndim != 2 or num0.shape[1] != exp_num_dim:
+        return False, f"num feature dim mismatch: got {getattr(num0,'shape',None)}, expected (*,{exp_num_dim})"
+    if cat0.ndim != 2 or cat0.shape[1] != exp_cat_dim:
+        return False, f"cat feature dim mismatch: got {getattr(cat0,'shape',None)}, expected (*,{exp_cat_dim})"
+    if np.asarray(tgt0).shape[-1] != exp_tgt_dim:
+        return False, f"target dim mismatch: got {np.asarray(tgt0).shape}, expected (*,{exp_tgt_dim})"
+
+    return True, "ok"
+
+
 @dataclass
 class EpisodePack:
     episodes_num: List[np.ndarray]
@@ -546,6 +596,7 @@ def _train_csv_fingerprint(train_csv_path: str) -> str:
 def _episode_cache_path(
     cfg: DictConfig,
     train_csv_path: str,
+    vocabs: dict,
     target_policy: str,
     max_tail_k: int,
     field_x: float,
@@ -553,21 +604,23 @@ def _episode_cache_path(
     dt_clip_sec: float,
     dt_norm_ref_sec: float,
 ) -> Tuple[Path, Dict[str, Any], bool]:
-    """캐시 파일 경로 + 검증용 meta + compress 여부 반환."""
     cache_enabled = bool(getattr(cfg.output, "episode_cache_enabled", True))
     compress = bool(getattr(cfg.output, "episode_cache_compress", True))
     cache_dir_cfg = str(getattr(cfg.output, "episode_cache_dir", "cache/episodes_kfold_v3"))
     cache_dir = Path(to_absolute_path(cache_dir_cfg))
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    fp = _train_csv_fingerprint(train_csv_path)
+    fp = _train_csv_fingerprint(train_csv_path)  # 기존 유지(원하면 sha1로 강화 가능)
 
-    # 파일명은 너무 길어지지 않도록 해시로 축약
     raw_key = f"{Path(train_csv_path).name}|{fp}|{target_policy}|tail{max_tail_k}|fx{field_x}|fy{field_y}|dt{dt_clip_sec}|norm{dt_norm_ref_sec}"
     h = hashlib.sha1(raw_key.encode("utf-8")).hexdigest()[:12]
     fname = f"episodes_{h}_{target_policy}_tail{max_tail_k}.pkl"
     if compress:
         fname += ".gz"
+
+    vocab_sizes = _vocab_sizes_from_vocabs(vocabs)
+    vocab_sig = _sha1_json(vocab_sizes)[:12]
+    no_end_sig = _sha1_json(sorted(list(NO_END_TYPES)))[:12]
 
     meta = {
         "train_csv": os.path.abspath(train_csv_path),
@@ -578,7 +631,17 @@ def _episode_cache_path(
         "field_y": float(field_y),
         "dt_clip_sec": float(dt_clip_sec),
         "dt_norm_ref_sec": float(dt_norm_ref_sec),
-        "format_version": 1,
+
+        # ---- schema/version ----
+        "format_version": EPISODE_CACHE_FORMAT_VERSION,
+        "num_feature_dim": 21,     # build_train_episodes에서 stack 21개 :contentReference[oaicite:6]{index=6}
+        "cat_feature_dim": 4,      # [player_id, team_id, type_name, result_name] :contentReference[oaicite:7]{index=7}
+        "target_dim": 2,
+
+        # ---- vocab / preprocessing signatures ----
+        "vocab_sizes": vocab_sizes,
+        "vocab_sig": vocab_sig,
+        "no_end_types_sig": no_end_sig,
     }
     return (cache_dir / fname), meta, (cache_enabled and True)
 
@@ -614,10 +677,10 @@ def get_or_build_stage_episodes(
     dt_clip_sec: float,
     dt_norm_ref_sec: float,
 ) -> EpisodePack:
-    """(stage_policy, max_tail_k) 조합에 대한 에피소드 생성 + 디스크 캐시."""
     cache_path, meta, cache_enabled = _episode_cache_path(
         cfg=cfg,
         train_csv_path=train_csv_path,
+        vocabs=vocabs,
         target_policy=target_policy,
         max_tail_k=max_tail_k,
         field_x=field_x,
@@ -631,14 +694,13 @@ def get_or_build_stage_episodes(
             pack = _load_pickle(cache_path)
             if isinstance(pack, dict):
                 pack = EpisodePack(**pack)
-            # meta 검증 (핵심만)
-            if isinstance(pack, EpisodePack) and pack.meta.get("train_fp") == meta["train_fp"] and pack.meta.get(
-                "target_policy"
-            ) == meta["target_policy"] and int(pack.meta.get("max_tail_k")) == meta["max_tail_k"]: # type: ignore
+
+            ok, reason = _is_episode_pack_valid(pack, meta)
+            if ok:
                 print(f"[cache] load stage episodes: {cache_path} (episodes={len(pack.episodes_num)})")
                 return pack
             else:
-                print(f"[cache] stale/mismatch -> rebuild: {cache_path}")
+                print(f"[cache] stale/mismatch -> rebuild: {cache_path} ({reason})")
         except Exception as e:
             print(f"[cache] failed to load -> rebuild: {cache_path} (err={e})")
 
@@ -724,6 +786,7 @@ class LSTMWithEmb(nn.Module):
         dropout: float = 0.0,
         bidirectional: bool = False,
         emb_dropout: float = 0.0,
+        boundary_head: bool = False,
     ):
         super().__init__()
 
@@ -746,8 +809,12 @@ class LSTMWithEmb(nn.Module):
         )
 
         out_dim = hidden_dim * (2 if bidirectional else 1)
-        self.fc = nn.Linear(out_dim, 2)
-        self.bidirectional = bidirectional
+
+        self.fc_delta  = nn.Linear(out_dim, 2)   # 회귀
+        self.fc_out_y  = nn.Linear(out_dim, 1)   # 아웃 여부
+        self.fc_side_y = nn.Linear(out_dim, 2)   # 0라인/68라인 분류
+
+        self.boundary_head = bool(boundary_head)
 
     def forward(self, x_num: torch.Tensor, x_cat: torch.Tensor, lengths: torch.Tensor):
         emb_list = []
@@ -767,8 +834,14 @@ class LSTMWithEmb(nn.Module):
             h_last = h_n[-1]  # [B, H]
 
         # delta in normalized coord (anchor-relative)
-        out = torch.tanh(self.fc(h_last))  # [-1, 1]
-        return out
+        delta = torch.tanh(self.fc_delta(h_last))
+
+        if not self.boundary_head:
+            return delta
+
+        out_y_logit = self.fc_out_y(h_last).squeeze(-1)  # [B]
+        side_y_logit = self.fc_side_y(h_last)            # [B,2]
+        return {"delta": delta, "out_y_logit": out_y_logit, "side_y_logit": side_y_logit}
 
 
 # -------------------------

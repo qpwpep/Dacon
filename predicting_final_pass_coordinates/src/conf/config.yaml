@@ -45,8 +45,9 @@ train:
   dump_valid_errors_dir: outputs/valid_error_dumps
   two_stage: true
   stage2:
+    batch_size: 128
     epochs: 10
-    lr: 3e-4
+    lr: 5e-4
     max_tail_k: 64
 
   # ---- K-fold ----
