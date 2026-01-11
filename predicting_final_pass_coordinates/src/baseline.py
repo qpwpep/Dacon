@@ -210,6 +210,9 @@ def build_train_episodes(
             ref_team = int(team_vals[t_idx])
             g_ref = unified_cache[ref_team].iloc[: t_idx + 1].reset_index(drop=True)
 
+            g_ref = g_ref.copy()
+            g_ref.loc[g_ref.index[-1], "result_name"] = "None"   # target pass outcome mask
+
             # --- absolute normalized coords (0~1) ---
             sx_abs = (g_ref["start_x"].values / field_x).astype(np.float32)  # type: ignore
             sy_abs = (g_ref["start_y"].values / field_y).astype(np.float32)  # type: ignore
@@ -367,6 +370,9 @@ def build_test_sequence_from_path(
 
     ref_team = int(g["team_id"].iloc[-1])
     g = unify_frame_to_ref_team(g, ref_team_id=ref_team, field_x=field_x, field_y=field_y)
+
+    g = g.copy()
+    g.loc[g.index[-1], "result_name"] = "None"
 
     T = len(g)
 
@@ -776,6 +782,13 @@ def prepare_required_stage_episodes(cfg: DictConfig, *, train_csv_path: str, voc
 # Model
 # -------------------------
 class LSTMWithEmb(nn.Module):
+    """Sequence encoder (LSTM) + categorical embeddings -> pass-end delta regression.
+
+    NOTE:
+    - 'boundary head' (out-of-bounds / sideline classification heads) has been removed as requested.
+    - The model always returns a single tensor: delta in normalized anchor-relative coordinates, clipped by tanh to [-1, 1].
+    """
+
     def __init__(
         self,
         numeric_dim: int,
@@ -786,40 +799,37 @@ class LSTMWithEmb(nn.Module):
         dropout: float = 0.0,
         bidirectional: bool = False,
         emb_dropout: float = 0.0,
-        boundary_head: bool = False,
     ):
         super().__init__()
 
         self.cat_order = ["player_id", "team_id", "type_name", "result_name"]
+        self.bidirectional = bool(bidirectional)
 
         self.embs = nn.ModuleDict(
             {name: nn.Embedding(vocab_sizes[name], emb_dims[name], padding_idx=0) for name in self.cat_order}
         )
         self.emb_dropout = nn.Dropout(emb_dropout)
 
-        in_dim = numeric_dim + sum(emb_dims[name] for name in self.cat_order)
+        in_dim = int(numeric_dim) + sum(int(emb_dims[name]) for name in self.cat_order)
 
         self.lstm = nn.LSTM(
             input_size=in_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0.0,
+            hidden_size=int(hidden_dim),
+            num_layers=int(num_layers),
+            dropout=float(dropout) if int(num_layers) > 1 else 0.0,
             batch_first=True,
-            bidirectional=bidirectional,
+            bidirectional=self.bidirectional,
         )
 
-        out_dim = hidden_dim * (2 if bidirectional else 1)
+        out_dim = int(hidden_dim) * (2 if self.bidirectional else 1)
+        self.fc_delta = nn.Linear(out_dim, 2)  # regression head
 
-        self.fc_delta  = nn.Linear(out_dim, 2)   # 회귀
-        self.fc_out_y  = nn.Linear(out_dim, 1)   # 아웃 여부
-        self.fc_side_y = nn.Linear(out_dim, 2)   # 0라인/68라인 분류
-
-        self.boundary_head = bool(boundary_head)
-
-    def forward(self, x_num: torch.Tensor, x_cat: torch.Tensor, lengths: torch.Tensor):
+    def forward(self, x_num: torch.Tensor, x_cat: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        # x_num: [B, T, F_num]
+        # x_cat: [B, T, 4]
         emb_list = []
         for i, name in enumerate(self.cat_order):
-            emb = self.embs[name](x_cat[:, :, i])  # [B,T,E]
+            emb = self.embs[name](x_cat[:, :, i])  # [B, T, E]
             emb_list.append(emb)
 
         x = torch.cat([x_num] + emb_list, dim=-1)
@@ -833,15 +843,9 @@ class LSTMWithEmb(nn.Module):
         else:
             h_last = h_n[-1]  # [B, H]
 
-        # delta in normalized coord (anchor-relative)
+        # delta in normalized anchor-relative coord, constrained to [-1, 1]
         delta = torch.tanh(self.fc_delta(h_last))
-
-        if not self.boundary_head:
-            return delta
-
-        out_y_logit = self.fc_out_y(h_last).squeeze(-1)  # [B]
-        side_y_logit = self.fc_side_y(h_last)            # [B,2]
-        return {"delta": delta, "out_y_logit": out_y_logit, "side_y_logit": side_y_logit}
+        return delta
 
 
 # -------------------------
