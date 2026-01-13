@@ -1,0 +1,8 @@
+# conf/model/logistic_regression.yaml
+_target_: sklearn.linear_model.LogisticRegression
+C: 1.0
+penalty: l2
+solver: liblinear           # sparse 입력 호환(이진분류에 무난)
+max_iter: 2000
+class_weight: balanced
+random_state: ${seed}

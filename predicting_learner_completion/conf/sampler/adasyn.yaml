@@ -1,0 +1,11 @@
+# conf/sampler/adasyn.yaml
+# 필요: pip install imbalanced-learn
+# ADASYN: 어려운 샘플 주변에 더 많이 생성
+enable: true
+sampler:
+  _target_: imblearn.over_sampling.ADASYN
+  random_state: ${seed}
+
+  # --- 핵심 sweep 축 ---
+  sampling_strategy: auto
+  n_neighbors: 5              # int (minority NN)

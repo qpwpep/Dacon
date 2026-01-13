@@ -1,0 +1,23 @@
+# conf/preprocess/onehot_sparse.yaml
+# 선형모델(로지스틱/SVM)에서 흔히 쓰는 희소 원핫
+remainder: drop
+sparse_threshold: 1.0  # 희소 유지(대부분 sparse로 나감)
+
+numeric:
+  steps:
+    - name: imputer
+      transformer:
+        _target_: sklearn.impute.SimpleImputer
+        strategy: median
+
+categorical:
+  steps:
+    - name: imputer
+      transformer:
+        _target_: sklearn.impute.SimpleImputer
+        strategy: most_frequent
+    - name: onehot
+      transformer:
+        _target_: ${project.module}.make_onehot
+        handle_unknown: ignore
+        sparse_output: true

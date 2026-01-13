@@ -1,0 +1,13 @@
+# conf/sampler/smotenc.yaml
+# 필요: pip install imbalanced-learn
+# SMOTENC: categorical-aware SMOTE
+# categorical_features: auto 를 쓰면 코드가 [num|cat] 구조 기준으로 categorical index를 자동 주입합니다.
+# ⚠️ preprocess=ordinal_encoded (범주형이 OrdinalEncoder로 1컬럼씩 유지) 권장
+enable: true
+sampler:
+  _target_: imblearn.over_sampling.SMOTENC
+  random_state: ${seed}
+
+  sampling_strategy: auto
+  k_neighbors: 5
+  categorical_features: auto  # auto | [indices...]

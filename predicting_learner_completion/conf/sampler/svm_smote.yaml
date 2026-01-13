@@ -1,0 +1,12 @@
+# conf/sampler/svm_smote.yaml
+# 필요: pip install imbalanced-learn
+# SVMSMOTE: SVM 기반 경계 샘플 생성 (m_neighbors 포함)
+enable: true
+sampler:
+  _target_: imblearn.over_sampling.SVMSMOTE
+  random_state: ${seed}
+
+  sampling_strategy: auto
+  k_neighbors: 5
+  m_neighbors: 10
+  out_step: 0.5              # (0,1] 생성 step

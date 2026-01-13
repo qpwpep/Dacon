@@ -1,0 +1,31 @@
+# conf/preprocess/catboost_encoder.yaml
+# CatBoostEncoder: 타깃 통계 기반 인코딩(순서/노이즈 완화) (dense 출력)
+# 필요: pip install category_encoders
+remainder: drop
+sparse_threshold: 0.0
+
+numeric:
+  steps:
+    - name: imputer
+      transformer:
+        _target_: sklearn.impute.SimpleImputer
+        strategy: median
+    - name: scaler
+      transformer:
+        _target_: sklearn.preprocessing.StandardScaler
+        with_mean: true
+        with_std: true
+
+categorical:
+  steps:
+    - name: imputer
+      transformer:
+        _target_: sklearn.impute.SimpleImputer
+        strategy: most_frequent
+    - name: catboost_encoder
+      transformer:
+        _target_: category_encoders.cat_boost.CatBoostEncoder
+        a: 1.0
+        sigma: 0.05
+        handle_unknown: value
+        handle_missing: value

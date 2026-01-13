@@ -1,0 +1,24 @@
+# conf/sampler/smoteenn.yaml
+# 필요: pip install imbalanced-learn
+# SMOTE + ENN 계열(노이즈 제거) 결합
+# ✅ ENN 종류는 sampler.sampler.enn._target_ override로 교체 가능
+enable: true
+sampler:
+  _target_: imblearn.combine.SMOTEENN
+  random_state: ${seed}
+
+  # combine 레벨 sampling_strategy (imblearn 버전에 따라 동작 방식 차이 있을 수 있어 sweep 권장)
+  sampling_strategy: auto
+
+  # --- SMOTE 파트 (여기만 BorderlineSMOTE/SVMSMOTE로 교체 가능) ---
+  smote:
+    _target_: imblearn.over_sampling.SMOTE
+    random_state: ${seed}
+    sampling_strategy: auto
+    k_neighbors: 5
+
+  # --- ENN 파트 (기본: EditedNearestNeighbours) ---
+  enn:
+    _target_: imblearn.under_sampling.EditedNearestNeighbours
+    n_neighbors: 3
+    kind_sel: all             # all | mode  (ENN에서 흔히 sweep)

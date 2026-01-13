@@ -1,0 +1,60 @@
+# conf/config.yaml
+# "전처리 + 샘플러 + 모델"을 defaults에서 조합으로 선택합니다.
+defaults:
+  - preprocess: onehot_dense
+  - sampler: none
+  - model: random_forest
+  - _self_
+
+paths:
+  train: data/train.csv
+  test: data/test.csv
+  sample_sub: data/sample_submission.csv
+  out: submit.csv
+  model_out: model.joblib
+
+project:
+  module: train
+
+target: completed
+id_col: ID
+
+missing_threshold: 0.8
+
+seed: 42
+val_size: 0.2
+
+# null이면 target/id 제외 전체 사용
+feature_cols: null
+
+feature_engineering:
+  enable: true
+  major_field_col: major_field
+  new_col: is_major_it
+  it_major_pattern: "(?:IT|컴퓨터|전산|소프트웨어|SW|S/W|Computer|CS)"
+
+training:
+  stratify: true
+
+logging:
+  topk_features: 30
+
+wandb:
+  enable: false
+  project: "baseline-hydra"
+  entity: null
+  name: null
+  job_type: train
+  tags: []
+  notes: null
+  mode: "online"           # online | offline | disabled
+  artifact_name_prefix: "run"
+  log_model: true
+  log_submission: true
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}

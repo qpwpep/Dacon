@@ -1,0 +1,32 @@
+# conf/preprocess/ordinal_encoded.yaml
+# SMOTENC용 권장 전처리: 범주형을 OrdinalEncoder로 "1컬럼씩" 유지(dense)
+# - 수치형: impute + scaler
+# - 범주형: impute + OrdinalEncoder
+# ⚠️ OrdinalEncoder는 범주 순서가 임의라 선형모델에 바로 쓰기엔 부적합할 수 있음
+#    (하지만 SMOTENC 같은 'categorical feature aware' 샘플링에 필요)
+remainder: drop
+sparse_threshold: 0.0
+
+numeric:
+  steps:
+    - name: imputer
+      transformer:
+        _target_: sklearn.impute.SimpleImputer
+        strategy: median
+    - name: scaler
+      transformer:
+        _target_: sklearn.preprocessing.StandardScaler
+        with_mean: true
+        with_std: true
+
+categorical:
+  steps:
+    - name: imputer
+      transformer:
+        _target_: sklearn.impute.SimpleImputer
+        strategy: most_frequent
+    - name: ordinal
+      transformer:
+        _target_: sklearn.preprocessing.OrdinalEncoder
+        handle_unknown: use_encoded_value
+        unknown_value: -1
