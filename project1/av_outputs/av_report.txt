@@ -1,0 +1,20 @@
+Adversarial Validation AUC: 1.0000
+
+Top 20 permuted features (by mean AUC drop):
+           feature  importance_mean  importance_std
+cat__건물유형_IDC(전화국)         0.503844        0.004797
+ num__ESS저장용량(kWh)         0.000000        0.000000
+          num__day         0.000000        0.000000
+    num__PCS용량(kW)         0.000000        0.000000
+         num__hour         0.000000        0.000000
+   num__is_weekend         0.000000        0.000000
+          num__num         0.000000        0.000000
+          num__dow         0.000000        0.000000
+      num__강수량(mm)         0.000000        0.000000
+         num__건물번호         0.000000        0.000000
+     num__냉방면적(m2)         0.000000        0.000000
+       num__기온(°C)         0.000000        0.000000
+        num__습도(%)         0.000000        0.000000
+      num__연면적(m2)         0.000000        0.000000
+    num__일사(MJ/m2)         0.000000        0.000000
+    cat__건물유형_건물기타         0.000000        0.000000
