@@ -6,12 +6,26 @@ n_estimators: 5000        # used for early-stopping; final n_estimators will be 
 num_leaves: 63
 max_depth: -1
 min_child_samples: 20
+
 subsample: 0.8
 subsample_freq: 1
 colsample_bytree: 0.8
+
 reg_alpha: 0.1
 reg_lambda: 1.0
+
 random_state: ${train.seed}
+seed: ${train.seed}
+bagging_seed: ${train.seed}
+feature_fraction_seed: ${train.seed}
+data_random_seed: ${train.seed}
+extra_seed: ${train.seed}
+# drop_seed: ${train.seed}   # dart 쓰는 경우에만
+
+# 결정성 강화 옵션(가능하면 같이)
+deterministic: true
+force_row_wise: true
+
 n_jobs: -1
 verbose: -1
 

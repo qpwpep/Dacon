@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score, f1_score
+from sklearn.metrics import roc_auc_score, f1_score, precision_recall_curve
 
 import lightgbm as lgb
 
@@ -30,6 +30,38 @@ def seed_everything(seed: int) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 
+def normalize_blank_strings_df(df: pd.DataFrame) -> pd.DataFrame:
+    """공백/빈 문자열을 결측(np.nan)으로 통일.
+    - object/string 컬럼에만 적용
+    - '   ' 같이 공백만 있는 값도 결측으로 변환
+    """
+    df = df.copy()
+    for col in df.columns:
+        s = df[col]
+        if not (pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s)):
+            continue
+        s = s.astype("object")
+        mask = s.notna()
+        if mask.any():
+            stripped = s.loc[mask].astype(str).str.strip()
+            stripped = stripped.mask(stripped.eq(""), np.nan)
+            df.loc[mask, col] = stripped
+        else:
+            df[col] = s
+    return df
+
+
+def normalize_blank_series(s: pd.Series) -> pd.Series:
+    """Series에서 공백/빈 문자열을 결측(np.nan)으로 통일 (category 변환 직전 사용)."""
+    s = s.astype("object").copy()
+    mask = s.notna()
+    if mask.any():
+        stripped = s.loc[mask].astype(str).str.strip()
+        stripped = stripped.mask(stripped.eq(""), np.nan)
+        s.loc[mask] = stripped
+    return s
+
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """대회 컬럼 구성에 맞춘 최소 파생피처."""
     df = df.copy()
@@ -37,9 +69,9 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     # major_field 기반 파생피처 (존재할 때만)
     if "major_field" in df.columns:
         s = df["major_field"].astype("object")
-        s = s.fillna("__MISSING__").astype(str)
+        s = normalize_blank_series(s)  # 공백/빈 문자열 -> NaN
         df["major_field"] = s
-        df["is_major_it"] = s.str.contains("IT", regex=False).astype(int)
+        df["is_major_it"] = s.fillna("").astype(str).str.contains("IT", regex=False).astype(int)
 
     return df
 
@@ -109,7 +141,7 @@ def make_categorical_safe(
         if col not in train_df.columns:
             continue
 
-        tr = train_df[col].astype("object")
+        tr = normalize_blank_series(train_df[col])
         tr = tr.where(tr.notna(), "__MISSING__").astype(str)
         cats = pd.Index(tr.unique()).append(pd.Index(["__UNKNOWN__", "__MISSING__"]))
         cats = cats.drop_duplicates()
@@ -117,7 +149,7 @@ def make_categorical_safe(
         train_df[col] = pd.Categorical(tr, categories=cats)
 
         if col in test_df.columns:
-            te = test_df[col].astype("object")
+            te = normalize_blank_series(test_df[col])
             te = te.where(te.notna(), "__MISSING__").astype(str)
             te = te.where(te.isin(cats), "__UNKNOWN__")
             test_df[col] = pd.Categorical(te, categories=cats)
@@ -275,18 +307,54 @@ def wandb_log_artifact(run, path: Path, name: str, art_type: str) -> None:
     run.log_artifact(art)
 
 
-def search_best_threshold(y_true: np.ndarray, proba: np.ndarray, start: float, end: float, step: float) -> Tuple[float, float]:
-    best_t = 0.5
-    best_f1 = -1.0
-    t = start
-    while t <= end + 1e-12:
-        pred = (proba >= t).astype(int)
-        f1 = f1_score(y_true, pred)
-        if f1 > best_f1:
-            best_f1 = f1
-            best_t = float(t)
-        t += step
-    return best_t, float(best_f1)
+def search_best_threshold(
+    y_true: np.ndarray,
+    proba: np.ndarray,
+    min_t: float = 0.05,
+    max_t: float = 0.95,
+) -> Tuple[float, float]:
+    """OOF 확률(proba)에 대해 F1이 최대가 되는 threshold를 '정확하게' 탐색 + clamp.
+
+    - grid loop(0.01 step) 대신, precision_recall_curve가 만들어주는 임계값 후보(=고유 score 경계)에서
+      F1을 계산해 최댓값을 선택합니다. (pred = proba >= threshold 기준)
+    - 선택된 threshold는 [min_t, max_t] 범위로 제한합니다.
+      (범위 밖 후보는 아예 제외한 뒤 최적을 찾고, 범위 내 후보가 하나도 없으면 0.5를 clamp해서 사용)
+    """
+    # 방어적 캐스팅
+    y_true = np.asarray(y_true).astype(int)
+    proba = np.asarray(proba).astype(float)
+
+    if min_t > max_t:
+        min_t, max_t = max_t, min_t
+
+    # safety: nan proba는 아주 작은 값으로 처리 (있으면 비정상 케이스)
+    if np.isnan(proba).any():
+        proba = np.nan_to_num(proba, nan=-1.0)
+
+    precision, recall, thresholds = precision_recall_curve(y_true, proba)
+
+    # thresholds가 비는 경우: proba가 모두 동일하거나 데이터가 극단 케이스
+    if thresholds.size == 0:
+        t = float(np.clip(0.5, min_t, max_t))
+        return t, float(f1_score(y_true, (proba >= t).astype(int)))
+
+    # precision/recall은 thresholds보다 1개 길다 -> 마지막 원소(임계값 없음)는 제외
+    denom = (precision[:-1] + recall[:-1] + 1e-15)
+    f1s = (2.0 * precision[:-1] * recall[:-1]) / denom
+
+    # ✅ 후보를 범위로 제한 (정확 최적 + 범위 보장)
+    mask = (thresholds >= min_t) & (thresholds <= max_t)
+    if np.any(mask):
+        cand_t = thresholds[mask]
+        cand_f1 = f1s[mask]
+        best_idx = int(np.nanargmax(cand_f1))
+        best_t = float(cand_t[best_idx])
+        best_f1 = float(cand_f1[best_idx])
+        return best_t, best_f1
+
+    # 범위 내 threshold 후보가 하나도 없으면, 0.5를 clamp해서 사용
+    t = float(np.clip(0.5, min_t, max_t))
+    return t, float(f1_score(y_true, (proba >= t).astype(int)))
 
 
 def _select(cfg, key: str, default=None):
@@ -454,9 +522,8 @@ def run_optuna_tuning(
             t, f1_best = search_best_threshold(
                 y_true=y.values,
                 proba=oof,
-                start=float(cfg.train.optimize_threshold.grid_start),
-                end=float(cfg.train.optimize_threshold.grid_end),
-                step=float(cfg.train.optimize_threshold.grid_step),
+                min_t=float(cfg.train.optimize_threshold.clamp_min),
+                max_t=float(cfg.train.optimize_threshold.clamp_max)
             )
             trial.set_user_attr("best_threshold", float(t))
             return float(f1_best)
@@ -655,6 +722,10 @@ def main(cfg: DictConfig) -> None:
     train = pd.read_csv(train_path)
     test = pd.read_csv(test_path)
 
+    # 공백/빈 문자열을 결측으로 통일 (문자열 컬럼)
+    train = normalize_blank_strings_df(train)
+    test = normalize_blank_strings_df(test)
+
     if cfg.data.target_col not in train.columns:
         raise ValueError(f"train에 target 컬럼({cfg.data.target_col})이 없습니다.")
 
@@ -776,9 +847,8 @@ def main(cfg: DictConfig) -> None:
         t, f1_best = search_best_threshold(
             y_true=y.values,
             proba=oof_proba,
-            start=float(cfg.train.optimize_threshold.grid_start),
-            end=float(cfg.train.optimize_threshold.grid_end),
-            step=float(cfg.train.optimize_threshold.grid_step),
+            min_t=float(cfg.train.optimize_threshold.clamp_min),
+            max_t=float(cfg.train.optimize_threshold.clamp_max)
         )
         threshold = t
         best_f1 = f1_best

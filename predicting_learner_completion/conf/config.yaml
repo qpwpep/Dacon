@@ -1,11 +1,11 @@
 # @package _global_
 defaults:
   - _self_
-  - data: default
+  - data: data_default
   - model: lgbm
-  - train: default
-  - optuna: default
-  - wandb: default
+  - train: train_default
+  - optuna: optuna_default
+  - wandb: wandb_default
 
 # Hydra output dir (runs are created under this folder)
 hydra:
