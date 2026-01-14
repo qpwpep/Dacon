@@ -1,0 +1,19 @@
+# @package model
+# LightGBM params for LGBMClassifier
+objective: binary
+learning_rate: 0.05
+n_estimators: 5000        # used for early-stopping; final n_estimators will be set to median(best_iteration)
+num_leaves: 63
+max_depth: -1
+min_child_samples: 20
+subsample: 0.8
+colsample_bytree: 0.8
+reg_alpha: 0.0
+reg_lambda: 0.0
+random_state: ${train.seed}
+n_jobs: -1
+verbose: -1
+
+# Imbalance handling
+is_unbalance: false
+# Alternatively (keep false unless you know the ratio): scale_pos_weight: null

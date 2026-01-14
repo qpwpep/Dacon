@@ -1,0 +1,20 @@
+# @package wandb
+enable: true
+
+# Change these to your workspace
+project: predicting_learner_completion
+entity: null
+
+# "offline" is safe default (no login needed). Switch to "online" when you want to sync.
+mode: offline
+
+tags: []
+notes: null
+group: null
+job_type: train
+
+# If true, save submission/proba/model as W&B artifacts
+log_artifacts: true
+
+# If true, also log a feature-importance table
+log_feature_importance: true

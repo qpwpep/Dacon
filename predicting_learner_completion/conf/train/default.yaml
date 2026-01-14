@@ -1,0 +1,25 @@
+# @package train
+n_splits: 5
+seed: 42
+
+early_stopping_rounds: 200
+log_period: 200
+
+# Prediction threshold for F1 and submission
+threshold: 0.5
+
+# Optional: search best threshold on OOF to maximize F1
+optimize_threshold:
+  enable: true
+  grid_start: 0.05
+  grid_end: 0.95
+  grid_step: 0.01
+
+# Outputs (saved inside Hydra run dir)
+out_path: submit_lgbm.csv
+out_proba_path: submit_lgbm_proba.csv
+oof_path: oof_proba.csv
+
+# Save LightGBM model
+save_model: true
+model_path: final_model.txt

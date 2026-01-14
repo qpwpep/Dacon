@@ -1,0 +1,23 @@
+# @package data
+train_path: data/train.csv
+test_path: data/test.csv
+sample_submission_path: data/sample_submission.csv
+
+target_col: completed
+id_col: ID
+
+# Drop columns whose missing rate (computed on train) is strictly greater than this threshold
+drop_missing_threshold: 0.8
+
+# Optional: also drop constant columns (nunique <= 1 on train)
+drop_constant_cols: true
+
+# Treat low-cardinality numeric columns as categorical by casting to string then category
+categorical_numeric:
+  enable: true
+  max_unique: 200          # include coded columns like school1, class1...
+  include_bool: true       # whether to include bool cols as categorical
+  # columns that should never be converted to categorical
+  exclude:
+  - ${data.target_col}
+  - ${data.id_col}

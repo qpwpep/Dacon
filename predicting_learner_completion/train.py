@@ -1,268 +1,127 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-train_model_hydra_wandb.py
-
-- Hydra로 "전처리 + 샘플러 + 모델"을 전부 config 조합으로 스위칭
-- 모델: conf/model/*.yaml에서 _target_만 바꿔 교체
-- 전처리: conf/preprocess/*.yaml에서 step들의 _target_만 바꿔 교체
-- 샘플러(SMOTE 등): conf/sampler/*.yaml에서 enable + _target_로 교체
-- W&B: 설정/메트릭/아티팩트 기록
-
-실행 예시
----------
-# 기본 (preprocess=onehot_dense, sampler=none, model=random_forest)
-python train_model_hydra_wandb.py
-
-# 전처리만 교체 (희소 원핫 + 표준화) + 로지스틱
-python train_model_hydra_wandb.py preprocess=standardize_onehot_sparse model=logistic_regression
-
-# 전처리(TargetEncoder) + SMOTE + XGBoost (xgboost, imbalanced-learn, category_encoders 설치 필요)
-python train_model_hydra_wandb.py preprocess=target_encoder sampler=smote model=xgboost
-
-# 멀티런(스윕)
-python train_model_hydra_wandb.py -m \
-  preprocess=onehot_sparse,standardize_onehot_sparse \
-  model=logistic_regression,random_forest \
-  seed=1,2,3
-
-주의
-----
-- RandomForest/트리 모델은 보통 sparse 입력을 직접 처리하지 못합니다.
-  -> preprocess=onehot_dense(기본) 또는 preprocess=target_encoder/catboost_encoder(출력 dense) 권장
-- SMOTE는 기본적으로 dense 입력을 기대합니다(특히 one-hot 희소행렬과 궁합이 안 좋음).
-  -> preprocess=target_encoder/catboost_encoder 같은 dense 인코딩 + sampler=smote 추천
-"""
-from __future__ import annotations
-
-import re
-import warnings
+import os
+import random
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import joblib
 import numpy as np
 import pandas as pd
 
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score, f1_score
+
+import lightgbm as lgb
+
 import hydra
-from hydra.utils import instantiate, to_absolute_path
+from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
-from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline as SkPipeline
 
-# ---- Optional: Hydra runtime choices (selected config names)
-try:
-    from hydra.core.hydra_config import HydraConfig
-except Exception:
-    HydraConfig = None
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
 
 
-# -------------------------
-# Helper factories (Hydra _target_로 참조 가능)
-# -------------------------
-def make_onehot(handle_unknown: str = "ignore", sparse_output: bool = True):
-    """
-    sklearn OneHotEncoder 생성 (버전 호환: sparse_output / sparse)
-    config에서 _target_: train_model_hydra_wandb.make_onehot 로 사용
-    """
-    from sklearn.preprocessing import OneHotEncoder
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    """대회 컬럼 구성에 맞춘 최소 파생피처."""
+    df = df.copy()
 
-    try:
-        return OneHotEncoder(handle_unknown=handle_unknown, sparse_output=sparse_output)
-    except TypeError:
-        # older sklearn
-        return OneHotEncoder(handle_unknown=handle_unknown, sparse=sparse_output)
+    # major_field 기반 파생피처 (존재할 때만)
+    if "major_field" in df.columns:
+        s = df["major_field"].astype("object")
+        s = s.fillna("__MISSING__").astype(str)
+        df["major_field"] = s
+        df["is_major_it"] = s.str.contains("IT", regex=False).astype(int)
 
-
-def load_csv(path: str | Path) -> pd.DataFrame:
-    return pd.read_csv(path)
-
-
-def add_features(df: pd.DataFrame, cfg: DictConfig) -> pd.DataFrame:
-    """
-    간단한 feature engineering:
-    - major_field 컬럼에 IT 관련 키워드가 들어가면 is_major_it=1
-    """
-    fe = cfg.feature_engineering
-    if not fe.enable:
-        return df
-
-    major_col = fe.major_field_col
-    new_col = fe.new_col
-    pattern = fe.it_major_pattern
-
-    if major_col not in df.columns:
-        warnings.warn(f"[feature_engineering] column '{major_col}' not found. Skip '{new_col}'.")
-        return df
-
-    s = df[major_col].astype(str).fillna("")
-    df[new_col] = s.str.contains(pattern, flags=re.IGNORECASE, regex=True).astype(int)
     return df
 
 
-def drop_high_missing(
-    train: pd.DataFrame,
-    test: pd.DataFrame,
+def drop_high_missing_cols(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
     threshold: float,
-    protect_cols: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
-    protect_cols = protect_cols or []
-    ratios = train.isna().mean()
-    drop_cols = [c for c, r in ratios.items() if (r > threshold and c not in protect_cols)]
-    if drop_cols:
-        train = train.drop(columns=drop_cols, errors="ignore")
-        test = test.drop(columns=drop_cols, errors="ignore")
-    return train, test, drop_cols
+    """train 기준 결측률이 threshold 초과인 컬럼 드랍."""
+    miss = train_df.isna().mean()
+    drop_cols = miss[miss > threshold].index.tolist()
+    return train_df.drop(columns=drop_cols), test_df.drop(columns=drop_cols, errors="ignore"), drop_cols
 
 
-def parse_feature_cols(feature_cols: Optional[str]) -> Optional[List[str]]:
-    if feature_cols is None:
-        return None
-    if isinstance(feature_cols, str):
-        cols = [c.strip() for c in feature_cols.split(",") if c.strip()]
-        return cols or None
-    return None
+def drop_constant_cols(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    """train 기준 nunique<=1 인 상수 컬럼 드랍."""
+    nunique = train_df.nunique(dropna=False)
+    const_cols = nunique[nunique <= 1].index.tolist()
+    return train_df.drop(columns=const_cols), test_df.drop(columns=const_cols, errors="ignore"), const_cols
 
 
-def split_columns_auto(X: pd.DataFrame) -> Tuple[List[str], List[str]]:
-    cat_cols: List[str] = []
-    num_cols: List[str] = []
-
-    for c in X.columns:
-        if (
-            pd.api.types.is_bool_dtype(X[c])
-            or pd.api.types.is_object_dtype(X[c])
-            or pd.api.types.is_string_dtype(X[c])
-            or isinstance(X[c].dtype, pd.CategoricalDtype)
-        ):
-            cat_cols.append(c)
-        else:
-            num_cols.append(c)
-
-    return num_cols, cat_cols
-
-
-def build_steps(steps_cfg) -> List[Tuple[str, Any]]:
-    """
-    steps_cfg 형식(예):
-      steps:
-        - name: imputer
-          transformer:
-            _target_: sklearn.impute.SimpleImputer
-            strategy: median
-    """
-    steps: List[Tuple[str, Any]] = []
-    if steps_cfg is None:
-        return steps
-
-    for i, st in enumerate(steps_cfg):
-        name = st.get("name", f"step{i}")
-        tr_cfg = st.get("transformer", None)
-        if tr_cfg is None:
+def infer_numeric_categorical_cols(
+    train_df: pd.DataFrame,
+    max_unique: int,
+    include_bool: bool,
+    exclude: List[str],
+) -> List[str]:
+    """저유니크 numeric/bool 컬럼을 category로 취급하기 위한 후보 리스트."""
+    cols: List[str] = []
+    for col in train_df.columns:
+        if col in exclude:
             continue
-        tr = instantiate(tr_cfg)
-        steps.append((name, tr))
-    return steps
+        s = train_df[col]
+        if pd.api.types.is_bool_dtype(s):
+            if include_bool:
+                cols.append(col)
+            continue
+        if pd.api.types.is_numeric_dtype(s):
+            # NaN 제외한 유니크 수로 판단
+            nuniq = s.nunique(dropna=True)
+            if nuniq <= max_unique:
+                cols.append(col)
+    return cols
 
 
-def build_preprocessor(X: pd.DataFrame, cfg: DictConfig) -> ColumnTransformer:
+def make_categorical_safe(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    categorical_cols: List[str],
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], Dict[str, List[str]]]:
     """
-    conf/preprocess/*.yaml 조합에 따라 ColumnTransformer를 구성합니다.
-    - numeric.steps / categorical.steps를 각각 Pipeline로 만들고 ColumnTransformer에 넣음
+    지정된 컬럼을 pandas category로 변환.
+    - train에서 본 카테고리 + __UNKNOWN__ + __MISSING__ 만 허용
+    - test에서 train에 없던 값은 __UNKNOWN__으로 매핑
     """
-    num_cols, cat_cols = split_columns_auto(X)
+    train_df = train_df.copy()
+    test_df = test_df.copy()
 
-    num_steps = build_steps(cfg.preprocess.numeric.steps)
-    cat_steps = build_steps(cfg.preprocess.categorical.steps)
+    categories_map: Dict[str, List[str]] = {}
+    cat_cols: List[str] = []
 
-    num_pipe = SkPipeline(steps=num_steps) if num_steps else "passthrough"
-    cat_pipe = SkPipeline(steps=cat_steps) if cat_steps else "passthrough"
+    for col in categorical_cols:
+        if col not in train_df.columns:
+            continue
 
-    pre = ColumnTransformer(
-        transformers=[
-            ("num", num_pipe, num_cols),
-            ("cat", cat_pipe, cat_cols),
-        ],
-        remainder=cfg.preprocess.remainder,
-        sparse_threshold=float(cfg.preprocess.sparse_threshold),
-    )
-    return pre
+        tr = train_df[col].astype("object")
+        tr = tr.where(tr.notna(), "__MISSING__").astype(str)
+        cats = pd.Index(tr.unique()).append(pd.Index(["__UNKNOWN__"]))
+        cats = cats.drop_duplicates()
 
+        train_df[col] = pd.Categorical(tr, categories=cats)
 
-def safe_instantiate_model(cfg: DictConfig):
-    try:
-        return instantiate(cfg.model)
-    except ModuleNotFoundError as e:
-        target = getattr(cfg.model, "_target_", "")
-        if "xgboost" in target:
-            raise ModuleNotFoundError(
-                "xgboost가 설치되어 있지 않습니다. `pip install xgboost` 후 다시 실행하세요."
-            ) from e
-        if "lightgbm" in target:
-            raise ModuleNotFoundError(
-                "lightgbm이 설치되어 있지 않습니다. `pip install lightgbm` 후 다시 실행하세요."
-            ) from e
-        raise
+        if col in test_df.columns:
+            te = test_df[col].astype("object")
+            te = te.where(te.notna(), "__MISSING__").astype(str)
+            te = te.where(te.isin(cats), "__UNKNOWN__")
+            test_df[col] = pd.Categorical(te, categories=cats)
+        else:
+            # test에 없으면, 이후 reindex에서 자동으로 채워지도록 둔다
+            pass
 
+        categories_map[col] = [str(x) for x in list(cats)]
+        cat_cols.append(col)
 
-def safe_instantiate_sampler(cfg: DictConfig, num_cols_count: int, cat_cols_count: int):
-    # sampler는 preprocess 뒤에 적용됩니다.
-    # - 일반 SMOTE/ADASYN/언더샘플러/SMOTEENN/SMOTETomek: 그대로 instantiate
-    # - SMOTENC: categorical_features 인덱스가 필요
-    #   * conf에서 categorical_features: auto 로 두면
-    #     ColumnTransformer 출력이 [num | cat] (cat이 OrdinalEncoder로 1컬럼씩 유지된다는 가정)일 때
-    #     categorical index를 자동으로 채웁니다.
-    if not cfg.sampler.enable:
-        return None
-    if cfg.sampler.sampler is None:
-        return None
-
-    try:
-        target = getattr(cfg.sampler.sampler, "_target_", "")
-        if "SMOTENC" in str(target):
-            cat_feat = getattr(cfg.sampler.sampler, "categorical_features", None)
-            if cat_feat == "auto":
-                cat_indices = list(range(num_cols_count, num_cols_count + cat_cols_count))
-                return instantiate(cfg.sampler.sampler, categorical_features=cat_indices)
-        return instantiate(cfg.sampler.sampler)
-    except ModuleNotFoundError as e:
-        raise ModuleNotFoundError(
-            "imbalanced-learn이 설치되어 있지 않습니다. `pip install imbalanced-learn` 후 다시 실행하세요."
-        ) from e
-
-
-def build_pipeline(preprocess, sampler, model):
-    """
-    sampler가 있으면 imblearn.pipeline.Pipeline을 사용(중간에 resampling step 지원)
-    없으면 sklearn Pipeline 사용
-    """
-    if sampler is None:
-        return SkPipeline(steps=[("preprocess", preprocess), ("model", model)])
-
-    try:
-        from imblearn.pipeline import Pipeline as ImbPipeline  # type: ignore
-    except ModuleNotFoundError as e:
-        raise ModuleNotFoundError(
-            "SMOTE 등을 쓰려면 imbalanced-learn이 필요합니다. `pip install imbalanced-learn`"
-        ) from e
-
-    return ImbPipeline(steps=[("preprocess", preprocess), ("sampler", sampler), ("model", model)])
-
-
-def get_score_for_auc(model: Any, X: Any) -> Optional[np.ndarray]:
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(X)
-        if proba.ndim == 2 and proba.shape[1] >= 2:
-            return proba[:, 1]
-        return proba.ravel()
-    if hasattr(model, "decision_function"):
-        s = model.decision_function(X)
-        return np.asarray(s).ravel()
-    return None
+    return train_df, test_df, cat_cols, categories_map
 
 
 def maybe_init_wandb(cfg: DictConfig):
@@ -270,224 +129,307 @@ def maybe_init_wandb(cfg: DictConfig):
         return None
 
     try:
-        import wandb  # type: ignore
-    except ModuleNotFoundError as e:
-        raise ModuleNotFoundError(
-            "wandb가 설치되어 있지 않습니다. `pip install wandb` 후 다시 실행하세요."
-        ) from e
+        import wandb
 
-    cfg_dict = OmegaConf.to_container(cfg, resolve=True)
-    cfg_dict.pop("hydra", None)
-
-    run = wandb.init(
-        project=cfg.wandb.project,
-        entity=cfg.wandb.entity,
-        name=cfg.wandb.name,
-        job_type=cfg.wandb.job_type,
-        tags=list(cfg.wandb.tags) if cfg.wandb.tags else None,
-        notes=cfg.wandb.notes,
-        mode=cfg.wandb.mode,
-        config=cfg_dict,
-    )
-    return run
-
-
-def log_wandb_artifacts(run, cfg: DictConfig, model_path: Path, submit_path: Path):
-    import wandb  # type: ignore
-
-    if cfg.wandb.log_model and model_path.exists():
-        art = wandb.Artifact(name=f"{cfg.wandb.artifact_name_prefix}-model", type="model")
-        art.add_file(str(model_path))
-        run.log_artifact(art)
-
-    if cfg.wandb.log_submission and submit_path.exists():
-        art = wandb.Artifact(name=f"{cfg.wandb.artifact_name_prefix}-submission", type="submission")
-        art.add_file(str(submit_path))
-        run.log_artifact(art)
-
-
-def try_get_feature_names(pipe) -> Optional[np.ndarray]:
-    try:
-        pre = pipe.named_steps.get("preprocess", None)
-        if pre is None:
-            return None
-        if hasattr(pre, "get_feature_names_out"):
-            return pre.get_feature_names_out()
-    except Exception:
+        run = wandb.init(
+            project=cfg.wandb.project,
+            entity=cfg.wandb.entity,
+            mode=cfg.wandb.mode,
+            tags=list(cfg.wandb.tags) if cfg.wandb.tags else None,
+            notes=cfg.wandb.notes,
+            group=cfg.wandb.group,
+            job_type=cfg.wandb.job_type,
+            config=OmegaConf.to_container(cfg, resolve=True),
+        )
+        return run
+    except Exception as e:
+        print(f"[Warn] wandb init failed -> continue without wandb. err={e}")
         return None
-    return None
 
 
-def log_feature_importance_or_coef(run, pipe, topk: int = 30):
+def wandb_log(run, payload: Dict[str, Any], step: Optional[int] = None) -> None:
     if run is None:
         return
-    try:
-        import wandb  # type: ignore
-    except Exception:
+    import wandb
+
+    wandb.log(payload, step=step)
+
+
+def wandb_log_artifact(run, path: Path, name: str, art_type: str) -> None:
+    if run is None:
         return
+    import wandb
 
-    model = pipe.named_steps.get("model", None)
-    if model is None:
-        return
-
-    feat_names = try_get_feature_names(pipe)
-    if feat_names is None:
-        return
-
-    rows = None
-    if hasattr(model, "feature_importances_"):
-        imp = np.asarray(model.feature_importances_).ravel()
-        if len(imp) == len(feat_names):
-            idx = np.argsort(-imp)[:topk]
-            rows = [(str(feat_names[i]), float(imp[i])) for i in idx]
-    elif hasattr(model, "coef_"):
-        coef = np.asarray(model.coef_).ravel()
-        if len(coef) == len(feat_names):
-            idx = np.argsort(-np.abs(coef))[:topk]
-            rows = [(str(feat_names[i]), float(coef[i])) for i in idx]
-
-    if rows:
-        table = wandb.Table(columns=["feature", "value"], data=rows)
-        run.log({"model/top_features": table})
+    art = wandb.Artifact(name=name, type=art_type)
+    art.add_file(str(path))
+    run.log_artifact(art)
 
 
-def log_selected_choices(run):
-    if run is None or HydraConfig is None:
-        return
-    try:
-        choices = HydraConfig.get().runtime.choices
-        # choices: {'model': 'random_forest', 'preprocess': 'onehot_dense', 'sampler': 'none', ...}
-        run.log(
-            {
-                "choice/model": choices.get("model"),
-                "choice/preprocess": choices.get("preprocess"),
-                "choice/sampler": choices.get("sampler"),
-            }
+def search_best_threshold(y_true: np.ndarray, proba: np.ndarray, start: float, end: float, step: float) -> Tuple[float, float]:
+    best_t = 0.5
+    best_f1 = -1.0
+    t = start
+    while t <= end + 1e-12:
+        pred = (proba >= t).astype(int)
+        f1 = f1_score(y_true, pred)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_t = float(t)
+        t += step
+    return best_t, float(best_f1)
+
+
+def cv_train(
+    cfg: DictConfig,
+    X: pd.DataFrame,
+    y: pd.Series,
+    test: pd.DataFrame,
+    cat_cols: List[str],
+    run,
+) -> Tuple[np.ndarray, List[int], List[float], List[float]]:
+    params = OmegaConf.to_container(cfg.model, resolve=True)
+    # LGBMClassifier expects dict; ensure it's a plain dict
+    params = dict(params)
+
+    skf = StratifiedKFold(n_splits=cfg.train.n_splits, shuffle=True, random_state=cfg.train.seed)
+
+    oof_proba = np.zeros(len(X), dtype=float)
+    best_iters: List[int] = []
+    aucs: List[float] = []
+    f1s: List[float] = []
+
+    print("\n[CV] Start")
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y), start=1):
+        X_tr, y_tr = X.iloc[tr_idx], y.iloc[tr_idx]
+        X_va, y_va = X.iloc[va_idx], y.iloc[va_idx]
+
+        model = lgb.LGBMClassifier(**params)
+
+        model.fit(
+            X_tr, y_tr,
+            eval_set=[(X_va, y_va)],
+            eval_metric="auc",
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=int(cfg.train.early_stopping_rounds), verbose=False),
+                lgb.log_evaluation(period=int(cfg.train.log_period)),
+            ],
+            categorical_feature=cat_cols if len(cat_cols) > 0 else "auto",
         )
-    except Exception:
-        pass
+
+        proba = model.predict_proba(X_va, num_iteration=model.best_iteration_)[:, 1]
+        oof_proba[va_idx] = proba
+
+        auc = roc_auc_score(y_va, proba)
+        pred = (proba >= float(cfg.train.threshold)).astype(int)
+        f1 = f1_score(y_va, pred)
+
+        aucs.append(float(auc))
+        f1s.append(float(f1))
+        best_iters.append(int(model.best_iteration_))
+
+        print(f"[Fold {fold}] best_iter={model.best_iteration_} | AUC={auc:.5f} | F1@{cfg.train.threshold}={f1:.5f}")
+        wandb_log(run, {"fold": fold, "cv/auc": auc, "cv/f1": f1, "cv/best_iter": model.best_iteration_}, step=fold)
+
+    return oof_proba, best_iters, aucs, f1s
 
 
-@hydra.main(version_base=None, config_path="conf", config_name="config")
+def fit_final_and_predict(
+    cfg: DictConfig,
+    X: pd.DataFrame,
+    y: pd.Series,
+    test: pd.DataFrame,
+    cat_cols: List[str],
+    best_iter_final: int,
+) -> Tuple[lgb.LGBMClassifier, np.ndarray]:
+    final_params = dict(OmegaConf.to_container(cfg.model, resolve=True))
+    final_params["n_estimators"] = int(best_iter_final)
+    model = lgb.LGBMClassifier(**final_params)
+    model.fit(X, y, categorical_feature=cat_cols if len(cat_cols) > 0 else "auto")
+    test_proba = model.predict_proba(test)[:, 1]
+    return model, test_proba
+
+
+@hydra.main(config_path="conf", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
-    # --- paths: Hydra run dir에서도 안정적으로 읽기 위해 절대경로화
-    train_path = Path(to_absolute_path(cfg.paths.train))
-    test_path = Path(to_absolute_path(cfg.paths.test))
-    sample_sub_path = Path(to_absolute_path(cfg.paths.sample_sub))
+    print("[Config]\n" + OmegaConf.to_yaml(cfg))
 
-    out_path = Path(cfg.paths.out)
-    model_out_path = Path(cfg.paths.model_out)
-
-    # --- load
-    train = load_csv(train_path)
-    test = load_csv(test_path)
-    sub = load_csv(sample_sub_path)
-
-    if cfg.target not in train.columns:
-        raise ValueError(f"Target column '{cfg.target}' not found in train")
-
-    # --- feature engineering
-    train = add_features(train, cfg)
-    test = add_features(test, cfg)
-
-    # --- drop missing-heavy columns
-    protect = [cfg.target, cfg.id_col]
-    train, test, dropped = drop_high_missing(train, test, cfg.missing_threshold, protect_cols=protect)
-
-    # --- select features
-    feature_cols = parse_feature_cols(cfg.feature_cols)
-    if feature_cols:
-        keep = [c for c in feature_cols if c in train.columns and c not in {cfg.target}]
-    else:
-        keep = [c for c in train.columns if c not in {cfg.target, cfg.id_col}]
-
-    X = train[keep].copy()
-    y = train[cfg.target].astype(int).values
-
-    # --- build preprocess + sampler + model from config
-    # 컬럼 개수(특히 SMOTENC categorical index 자동화를 위해)
-    num_cols, cat_cols = split_columns_auto(X)
-
-    preprocess = build_preprocessor(X, cfg)
-    sampler = safe_instantiate_sampler(cfg, num_cols_count=len(num_cols), cat_cols_count=len(cat_cols))
-    model = safe_instantiate_model(cfg)
-
-    pipe = build_pipeline(preprocess, sampler, model)
-
-    # --- validation split
-    X_tr, X_val, y_tr, y_val = train_test_split(
-        X,
-        y,
-        test_size=cfg.val_size,
-        random_state=cfg.seed,
-        stratify=y if cfg.training.stratify else None,
-    )
-
+    seed_everything(int(cfg.train.seed))
     run = maybe_init_wandb(cfg)
-    log_selected_choices(run)
 
-    # --- fit / eval
-    pipe.fit(X_tr, y_tr)
-    pred = pipe.predict(X_val)
+    # Resolve paths (Hydra changes cwd -> use to_absolute_path for inputs)
+    train_path = Path(to_absolute_path(cfg.data.train_path))
+    test_path = Path(to_absolute_path(cfg.data.test_path))
+    sample_submission_path = Path(to_absolute_path(cfg.data.sample_submission_path))
 
-    metrics: Dict[str, Any] = {
-        "val/acc": float(accuracy_score(y_val, pred)),
-        "val/f1": float(f1_score(y_val, pred)),
-    }
+    if not train_path.exists():
+        raise FileNotFoundError(f"train_path not found: {train_path}")
+    if not test_path.exists():
+        raise FileNotFoundError(f"test_path not found: {test_path}")
 
-    score = get_score_for_auc(pipe, X_val)
-    if score is not None:
-        try:
-            metrics["val/auc"] = float(roc_auc_score(y_val, score))
-        except Exception:
-            pass
+    train = pd.read_csv(train_path)
+    test = pd.read_csv(test_path)
 
-    print("[VAL]", {k: round(v, 6) for k, v in metrics.items() if isinstance(v, (float, int))})
+    if cfg.data.target_col not in train.columns:
+        raise ValueError(f"train에 target 컬럼({cfg.data.target_col})이 없습니다.")
 
-    if run is not None:
-        run.log(metrics)
-        run.log(
-            {
-                "data/train_rows": int(len(train)),
-                "data/test_rows": int(len(test)),
-                "data/num_features_raw": int(len(keep)),
-                "data/dropped_cols_count": int(len(dropped)),
-                "pipe/has_sampler": bool(sampler is not None),
-            }
+    y = train[cfg.data.target_col].astype(int)
+    X = train.drop(columns=[cfg.data.target_col])
+
+    # ID 제거(있으면)
+    if cfg.data.id_col in X.columns:
+        X = X.drop(columns=[cfg.data.id_col])
+    if cfg.data.id_col in test.columns:
+        test = test.drop(columns=[cfg.data.id_col])
+
+    # 파생피처
+    X = build_features(X)
+    test = build_features(test)
+
+    # 결측률 높은 컬럼 드랍(train 기준)
+    X, test, dropped_missing = drop_high_missing_cols(X, test, threshold=float(cfg.data.drop_missing_threshold))
+
+    # 상수 컬럼 드랍(train 기준)
+    dropped_const: List[str] = []
+    if bool(cfg.data.drop_constant_cols):
+        X, test, dropped_const = drop_constant_cols(X, test)
+
+    # 어떤 컬럼을 category로 볼지 결정
+    cat_cols = X.select_dtypes(include=["object"]).columns.tolist()
+
+    if bool(cfg.data.categorical_numeric.enable):
+        extra = infer_numeric_categorical_cols(
+            train_df=X,
+            max_unique=int(cfg.data.categorical_numeric.max_unique),
+            include_bool=bool(cfg.data.categorical_numeric.include_bool),
+            exclude=list(cfg.data.categorical_numeric.exclude),
         )
-        if dropped:
-            import wandb  # type: ignore
-            table = wandb.Table(columns=["dropped_col"], data=[[c] for c in dropped])
-            run.log({"data/dropped_cols": table})
+        # object + numeric-cat 합치기
+        cat_cols = sorted(set(cat_cols).union(set(extra)))
 
-        log_feature_importance_or_coef(run, pipe, topk=cfg.logging.topk_features)
+    X, test, cat_cols, categories_map = make_categorical_safe(X, test, categorical_cols=cat_cols)
 
-    # --- fit full & predict
-    pipe.fit(X, y)
-    X_test = test[keep].copy()
-    pred_test = pipe.predict(X_test)
+    # train/test 컬럼 정렬 및 누락 컬럼 처리
+    test = test.reindex(columns=X.columns, fill_value=np.nan)
 
-    # --- submission
-    submission = sub.copy()
-    if cfg.id_col in submission.columns and cfg.id_col in test.columns:
-        if submission[cfg.id_col].nunique() == len(submission) and test[cfg.id_col].nunique() == len(test):
-            tmp = pd.DataFrame({cfg.id_col: test[cfg.id_col].values, cfg.target: pred_test})
-            submission = submission.drop(columns=[cfg.target], errors="ignore").merge(tmp, on=cfg.id_col, how="left")
-        else:
-            submission[cfg.target] = pred_test
-    else:
-        submission[cfg.target] = pred_test
+    # Dataset summary
+    print(f"[Info] Train rows={len(train)} | Test rows={len(test)} | Features={X.shape[1]}")
+    print(f"[Info] Pos rate={y.mean():.4f} ({int(y.sum())}/{len(y)})")
+    print(f"[Info] Dropped missing>{cfg.data.drop_missing_threshold}: {len(dropped_missing)} cols -> {dropped_missing}")
+    if dropped_const:
+        print(f"[Info] Dropped constant cols: {len(dropped_const)} cols -> {dropped_const}")
+    print(f"[Info] Categorical cols: {len(cat_cols)}")
 
-    submission.to_csv(out_path, index=False, encoding="utf-8-sig")
-    print(f"[OK] saved submission to: {out_path.resolve()}")
-
-    # --- save model pipeline
-    joblib.dump(pipe, model_out_path)
-    print(f"[OK] saved model pipeline to: {model_out_path.resolve()}")
-
-    # --- wandb artifacts
     if run is not None:
-        log_wandb_artifacts(run, cfg, model_out_path, out_path)
+        # Put some key info into run summary
+        run.summary["data/train_rows"] = int(len(train))
+        run.summary["data/test_rows"] = int(len(test))
+        run.summary["data/pos_rate"] = float(y.mean())
+        run.summary["data/n_features"] = int(X.shape[1])
+        run.summary["data/dropped_missing_cols"] = len(dropped_missing)
+        run.summary["data/dropped_constant_cols"] = len(dropped_const)
+        run.summary["data/n_categorical_cols"] = len(cat_cols)
+
+    # CV
+    oof_proba, best_iters, aucs, f1s = cv_train(cfg, X, y, test, cat_cols, run)
+
+    auc_mean, auc_std = float(np.mean(aucs)), float(np.std(aucs))
+    f1_mean, f1_std = float(np.mean(f1s)), float(np.std(f1s))
+    best_iter_final = int(np.median(best_iters))
+
+    print("\n[CV] Done")
+    print(f"AUC mean={auc_mean:.5f} ± {auc_std:.5f}")
+    print(f"F1  mean={f1_mean:.5f} ± {f1_std:.5f}")
+    print(f"Use n_estimators={best_iter_final} (median best_iteration) for final fit")
+
+    # Optional: OOF-based threshold tuning
+    threshold = float(cfg.train.threshold)
+    best_f1 = float(f1_score(y.values, (oof_proba >= threshold).astype(int)))
+    if bool(cfg.train.optimize_threshold.enable):
+        t, f1_best = search_best_threshold(
+            y_true=y.values,
+            proba=oof_proba,
+            start=float(cfg.train.optimize_threshold.grid_start),
+            end=float(cfg.train.optimize_threshold.grid_end),
+            step=float(cfg.train.optimize_threshold.grid_step),
+        )
+        threshold = t
+        best_f1 = f1_best
+        print(f"[OOF] Best threshold={threshold:.3f} | F1={best_f1:.5f}")
+
+    # Log aggregate metrics
+    wandb_log(run, {
+        "cv/auc_mean": auc_mean,
+        "cv/auc_std": auc_std,
+        "cv/f1_mean": f1_mean,
+        "cv/f1_std": f1_std,
+        "train/best_iter_final": best_iter_final,
+        "oof/best_threshold": threshold,
+        "oof/f1_at_best_threshold": best_f1,
+    })
+
+    # Save OOF
+    oof_path = Path(cfg.train.oof_path)
+    pd.DataFrame({"oof_proba": oof_proba, "y_true": y.values}).to_csv(oof_path, index=False)
+    print("Saved OOF:", oof_path)
+    if run is not None and bool(cfg.wandb.log_artifacts):
+        wandb_log_artifact(run, oof_path, name="oof_proba", art_type="dataset")
+
+    # Final fit + predict
+    final_model, test_proba = fit_final_and_predict(cfg, X, y, test, cat_cols, best_iter_final)
+    test_pred = (test_proba >= threshold).astype(int)
+
+    # Submission
+    out_path = Path(cfg.train.out_path)
+    if sample_submission_path.exists():
+        sub = pd.read_csv(sample_submission_path)
+        if cfg.data.target_col not in sub.columns:
+            # sample_submission에 타깃 컬럼이 없으면 추가
+            sub[cfg.data.target_col] = test_pred
+        else:
+            sub[cfg.data.target_col] = test_pred
+        sub.to_csv(out_path, index=False)
+    else:
+        sub = pd.DataFrame({cfg.data.target_col: test_pred})
+        sub.to_csv(out_path, index=False)
+
+    print("Saved submission:", out_path)
+
+    # Probabilities
+    if cfg.train.out_proba_path:
+        proba_path = Path(cfg.train.out_proba_path)
+        pd.DataFrame({f"{cfg.data.target_col}_proba": test_proba}).to_csv(proba_path, index=False)
+        print("Saved proba:", proba_path)
+
+    # Save model
+    if bool(cfg.train.save_model):
+        model_path = Path(cfg.train.model_path)
+        # Use LightGBM Booster save if available
+        booster = final_model.booster_
+        booster.save_model(str(model_path))
+        print("Saved model:", model_path)
+
+    # W&B artifacts + feature importance
+    if run is not None:
+        if bool(cfg.wandb.log_feature_importance):
+            fi = pd.DataFrame({
+                "feature": X.columns,
+                "importance": final_model.feature_importances_,
+            }).sort_values("importance", ascending=False)
+            try:
+                import wandb
+                table = wandb.Table(dataframe=fi.head(200))
+                wandb.log({"feature_importance_top200": table})
+            except Exception as e:
+                print(f"[Warn] feature importance logging failed: {e}")
+
+        if bool(cfg.wandb.log_artifacts):
+            if out_path.exists():
+                wandb_log_artifact(run, out_path, name="submission", art_type="output")
+            if cfg.train.out_proba_path and Path(cfg.train.out_proba_path).exists():
+                wandb_log_artifact(run, Path(cfg.train.out_proba_path), name="submission_proba", art_type="output")
+            if bool(cfg.train.save_model) and Path(cfg.train.model_path).exists():
+                wandb_log_artifact(run, Path(cfg.train.model_path), name="final_model", art_type="model")
+
         run.finish()
 
 
