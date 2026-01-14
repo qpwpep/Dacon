@@ -1,0 +1,47 @@
+# @package train.optuna
+# Optuna tuning config (Hydra group: optuna=default)
+enable: false
+
+# What to optimize during tuning:
+# - "auc": maximize ROC-AUC
+# - "f1" : maximize F1 after searching best threshold on OOF
+metric: f1
+
+# Tuning budget
+n_trials: 50
+timeout: null        # seconds, or null
+
+# Use a lighter CV during tuning (final training can still use train.n_splits)
+n_splits: 3
+
+# Reproducibility
+seed: ${train.seed}
+
+# Sampler / Pruner
+sampler: tpe         # tpe | random
+use_pruner: true
+pruner:
+  name: median       # median | hyperband | nop
+  n_warmup_steps: 10 # used for median/hyperband
+
+# Optional: persist study to resume
+study_name: lgbm_tuning
+storage: null        # e.g. "sqlite:///optuna_lgbm.db"
+
+# Search space (these map to LGBMClassifier params)
+search_space:
+  num_leaves:
+    low: 16
+    high: 256
+    log: true
+  min_child_samples:
+    low: 10
+    high: 200
+    log: true
+  reg_lambda:
+    low: 1.0e-3
+    high: 100.0
+    log: true
+  feature_fraction:
+    low: 0.5
+    high: 1.0

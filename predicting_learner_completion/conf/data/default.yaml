@@ -7,7 +7,7 @@ target_col: completed
 id_col: ID
 
 # Drop columns whose missing rate (computed on train) is strictly greater than this threshold
-drop_missing_threshold: 0.8
+drop_missing_threshold: 0.95
 
 # Optional: also drop constant columns (nunique <= 1 on train)
 drop_constant_cols: true
@@ -15,7 +15,7 @@ drop_constant_cols: true
 # Treat low-cardinality numeric columns as categorical by casting to string then category
 categorical_numeric:
   enable: true
-  max_unique: 50          # include coded columns like school1, class1...
+  max_unique: 150          # include coded columns like school1, class1...
   include_bool: true       # whether to include bool cols as categorical
   # columns that should never be converted to categorical
   exclude:

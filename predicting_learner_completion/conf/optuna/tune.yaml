@@ -1,0 +1,20 @@
+# @package train.optuna
+# A more aggressive preset (Hydra: optuna=tune)
+enable: true
+metric: f1
+n_trials: 120
+timeout: null
+n_splits: 3
+seed: ${train.seed}
+sampler: tpe
+use_pruner: true
+pruner:
+  name: median
+  n_warmup_steps: 10
+study_name: lgbm_tuning_f1
+storage: "sqlite:///optuna_lgbm.db"
+search_space:
+  num_leaves: { low: 16, high: 256, log: true }
+  min_child_samples: { low: 10, high: 250, log: true }
+  reg_lambda: { low: 1.0e-3, high: 200.0, log: true }
+  feature_fraction: { low: 0.5, high: 1.0 }
