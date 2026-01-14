@@ -186,17 +186,25 @@ def cv_train(
     test: pd.DataFrame,
     cat_cols: List[str],
     run,
-) -> Tuple[np.ndarray, List[int], List[float], List[float]]:
-    params = OmegaConf.to_container(cfg.model, resolve=True)
-    # LGBMClassifier expects dict; ensure it's a plain dict
-    params = dict(params)
+    save_fold_models: bool = False,
+    fold_model_basepath: Optional[Path] = None,
+) -> Tuple[np.ndarray, np.ndarray, List[int], List[float], List[float], List[Path], np.ndarray]:
+    params = dict(OmegaConf.to_container(cfg.model, resolve=True))
 
-    skf = StratifiedKFold(n_splits=cfg.train.n_splits, shuffle=True, random_state=cfg.train.seed)
+    skf = StratifiedKFold(
+        n_splits=int(cfg.train.n_splits),
+        shuffle=True,
+        random_state=int(cfg.train.seed),
+    )
 
     oof_proba = np.zeros(len(X), dtype=float)
+    test_proba_sum = np.zeros(len(test), dtype=float)  # fold별 test proba 누적
+    feat_imp_sum = np.zeros(X.shape[1], dtype=float)   # fold별 feature importance 누적(평균용)
+
     best_iters: List[int] = []
     aucs: List[float] = []
     f1s: List[float] = []
+    fold_model_paths: List[Path] = []
 
     print("\n[CV] Start")
     for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y), start=1):
@@ -204,7 +212,6 @@ def cv_train(
         X_va, y_va = X.iloc[va_idx], y.iloc[va_idx]
 
         model = lgb.LGBMClassifier(**params)
-
         model.fit(
             X_tr, y_tr,
             eval_set=[(X_va, y_va)],
@@ -216,12 +223,21 @@ def cv_train(
             categorical_feature=cat_cols if len(cat_cols) > 0 else "auto",
         )
 
-        proba = model.predict_proba(X_va, num_iteration=model.best_iteration_)[:, 1]
-        oof_proba[va_idx] = proba
+        # OOF
+        proba_va = model.predict_proba(X_va, num_iteration=model.best_iteration_)[:, 1]
+        oof_proba[va_idx] = proba_va
 
-        auc = roc_auc_score(y_va, proba)
-        pred = (proba >= float(cfg.train.threshold)).astype(int)
-        f1 = f1_score(y_va, pred)
+        # Fold test proba 누적 (앙상블용)
+        proba_te = model.predict_proba(test, num_iteration=model.best_iteration_)[:, 1]
+        test_proba_sum += proba_te
+
+        # Feature importance 누적(평균)
+        feat_imp_sum += model.feature_importances_
+
+        # Metrics
+        auc = roc_auc_score(y_va, proba_va)
+        pred_va = (proba_va >= float(cfg.train.threshold)).astype(int)
+        f1 = f1_score(y_va, pred_va)
 
         aucs.append(float(auc))
         f1s.append(float(f1))
@@ -230,7 +246,21 @@ def cv_train(
         print(f"[Fold {fold}] best_iter={model.best_iteration_} | AUC={auc:.5f} | F1@{cfg.train.threshold}={f1:.5f}")
         wandb_log(run, {"fold": fold, "cv/auc": auc, "cv/f1": f1, "cv/best_iter": model.best_iteration_}, step=fold)
 
-    return oof_proba, best_iters, aucs, f1s
+        # (옵션) fold 모델 저장
+        if save_fold_models and fold_model_basepath is not None:
+            base = fold_model_basepath
+            suffix = base.suffix if base.suffix else ".txt"
+            fold_path = base.with_name(f"{base.stem}_fold{fold}{suffix}")
+            fold_path.parent.mkdir(parents=True, exist_ok=True)
+            model.booster_.save_model(str(fold_path))
+            fold_model_paths.append(fold_path)
+
+    n_splits = int(cfg.train.n_splits)
+    test_proba_mean = test_proba_sum / n_splits
+    feat_imp_mean = feat_imp_sum / n_splits
+
+    return oof_proba, test_proba_mean, best_iters, aucs, f1s, fold_model_paths, feat_imp_mean
+
 
 
 def fit_final_and_predict(
@@ -329,8 +359,16 @@ def main(cfg: DictConfig) -> None:
         run.summary["data/dropped_constant_cols"] = len(dropped_const)
         run.summary["data/n_categorical_cols"] = len(cat_cols)
 
-    # CV
-    oof_proba, best_iters, aucs, f1s = cv_train(cfg, X, y, test, cat_cols, run)
+    # CV (+ fold-ensemble prediction)
+    use_fold_ensemble = bool(getattr(cfg.train, "use_fold_ensemble", True))
+    save_fold_models = bool(cfg.train.save_model) and use_fold_ensemble
+    fold_model_basepath = Path(cfg.train.model_path) if save_fold_models else None
+
+    oof_proba, test_proba_cv, best_iters, aucs, f1s, fold_model_paths, cv_feat_imp = cv_train(
+        cfg, X, y, test, cat_cols, run,
+        save_fold_models=save_fold_models,
+        fold_model_basepath=fold_model_basepath,
+    )
 
     auc_mean, auc_std = float(np.mean(aucs)), float(np.std(aucs))
     f1_mean, f1_std = float(np.mean(f1s)), float(np.std(f1s))
@@ -374,8 +412,15 @@ def main(cfg: DictConfig) -> None:
     if run is not None and bool(cfg.wandb.log_artifacts):
         wandb_log_artifact(run, oof_path, name="oof_proba", art_type="dataset")
 
-    # Final fit + predict
-    final_model, test_proba = fit_final_and_predict(cfg, X, y, test, cat_cols, best_iter_final)
+    # Predict
+    if use_fold_ensemble:
+        test_proba = test_proba_cv
+        final_model = None
+        print(f"[Predict] Using fold-ensemble proba (mean over {cfg.train.n_splits} folds)")
+    else:
+        final_model, test_proba = fit_final_and_predict(cfg, X, y, test, cat_cols, best_iter_final)
+        print("[Predict] Using single final model fit on full data")
+
     test_pred = (test_proba >= threshold).astype(int)
 
     # Submission
@@ -403,17 +448,41 @@ def main(cfg: DictConfig) -> None:
     # Save model
     if bool(cfg.train.save_model):
         model_path = Path(cfg.train.model_path)
-        # Use LightGBM Booster save if available
-        booster = final_model.booster_
-        booster.save_model(str(model_path))
-        print("Saved model:", model_path)
+
+        if use_fold_ensemble:
+            # fold 모델은 cv_train에서 이미 저장됨(save_fold_models=True일 때)
+            manifest_path = model_path.with_name(f"{model_path.stem}_folds_manifest.txt")
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                f.write(f"use_fold_ensemble: {use_fold_ensemble}\n")
+                f.write(f"n_folds: {int(cfg.train.n_splits)}\n")
+                f.write(f"threshold: {float(threshold)}\n")
+                f.write("fold_model_paths:\n")
+                for fp in fold_model_paths:
+                    f.write(f"  - {str(fp)}\n")
+
+            print("Saved fold model manifest:", manifest_path)
+            if not fold_model_paths:
+                print("[Warn] fold_model_paths is empty (check save_fold_models / model_path).")
+
+        else:
+            booster = final_model.booster_
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            booster.save_model(str(model_path))
+            print("Saved model:", model_path)
 
     # W&B artifacts + feature importance
     if run is not None:
         if bool(cfg.wandb.log_feature_importance):
+            if use_fold_ensemble:
+                importances = cv_feat_imp
+            else:
+                importances = final_model.feature_importances_
+
             fi = pd.DataFrame({
                 "feature": X.columns,
-                "importance": final_model.feature_importances_,
+                "importance": importances,
             }).sort_values("importance", ascending=False)
             try:
                 import wandb

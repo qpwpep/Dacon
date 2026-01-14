@@ -701,9 +701,13 @@ baseline.ipynb
 /test
 *.csv
 /cache
+final_model*
 
 # wandb
 /wandb
+
+# hydra
+/multirun
 
 # allow scripts inside the code directory
 !code/

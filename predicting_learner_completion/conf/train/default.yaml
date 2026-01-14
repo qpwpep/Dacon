@@ -4,9 +4,10 @@ seed: 42
 
 early_stopping_rounds: 200
 log_period: 200
+use_fold_ensemble: true
 
 # Prediction threshold for F1 and submission
-threshold: 0.5
+threshold: 0.2
 
 # Optional: search best threshold on OOF to maximize F1
 optimize_threshold:

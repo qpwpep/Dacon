@@ -15,7 +15,7 @@ drop_constant_cols: true
 # Treat low-cardinality numeric columns as categorical by casting to string then category
 categorical_numeric:
   enable: true
-  max_unique: 200          # include coded columns like school1, class1...
+  max_unique: 50          # include coded columns like school1, class1...
   include_bool: true       # whether to include bool cols as categorical
   # columns that should never be converted to categorical
   exclude:
