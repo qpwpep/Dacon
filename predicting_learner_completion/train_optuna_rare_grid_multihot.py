@@ -67,9 +67,45 @@ def normalize_blank_series(s: pd.Series) -> pd.Series:
 # ---------------------------
 # Multi-label (comma-separated) parsing -> multi-hot features
 # ---------------------------
-
 _BRACKET_OPEN = set(["(", "[", "{"])
 _BRACKET_CLOSE = {")": "(", "]": "[", "}": "{"}
+
+_INTERESTED_COMPANY_COL = "interested_company"
+_PUNCT_ONLY_RE = re.compile(r"^[\W_]+$", flags=re.UNICODE)
+
+# expected_domain uses labels like "M. 전문, 과학 및 기술 서비스업"
+# where commas can be part of a single label. We merge tokens back using
+# the leading industry-code prefix pattern (e.g., "M. ").
+_EXPECTED_DOMAIN_COL = "expected_domain"
+_EXPECTED_DOMAIN_PREFIX_RE = re.compile(r"^[A-Z]\.\s*")
+
+
+def _merge_expected_domain_tokens(tokens: List[str]) -> List[str]:
+    """Merge split pieces for expected_domain.
+
+    We first split on commas, but labels themselves may contain commas.
+    Every new label starts with an industry-code prefix like "M. ".
+    Any subsequent token that does NOT start with the prefix is treated as a
+    continuation of the previous label and merged back with ", ".
+    """
+    merged: List[str] = []
+    buf: Optional[str] = None
+
+    for t in tokens:
+        if _EXPECTED_DOMAIN_PREFIX_RE.match(t):
+            if buf is not None:
+                merged.append(buf)
+            buf = t
+        else:
+            if buf is None:
+                merged.append(t)
+            else:
+                buf = f"{buf}, {t}"
+
+    if buf is not None:
+        merged.append(buf)
+
+    return merged
 
 
 def _split_outside_brackets(text: str, sep: str = ",") -> List[str]:
@@ -118,7 +154,7 @@ def _split_outside_brackets(text: str, sep: str = ",") -> List[str]:
     return parts
 
 
-def _parse_multilabel_cell(v: Any, sep: str = ",") -> List[str]:
+def _parse_multilabel_cell(v: Any, sep: str = ",", col_name: Optional[str] = None) -> List[str]:
     """Parse a single cell into token list (dedup, keep order)."""
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return []
@@ -133,9 +169,16 @@ def _parse_multilabel_cell(v: Any, sep: str = ",") -> List[str]:
         tt = re.sub(r"\s+", " ", str(t).strip())
         if tt == "":
             continue
+        if col_name == _INTERESTED_COMPANY_COL and _PUNCT_ONLY_RE.match(tt):
+            continue
         if tt not in seen:
             cleaned.append(tt)
             seen.add(tt)
+
+    # expected_domain: merge tokens back when commas are part of a label
+    if col_name == _EXPECTED_DOMAIN_COL:
+        cleaned = _merge_expected_domain_tokens(cleaned)
+
     return cleaned
 
 
@@ -190,9 +233,9 @@ def expand_multilabel_columns(
         if col not in train_df.columns:
             continue
 
-        tr_lists = train_df[col].apply(lambda v: _parse_multilabel_cell(v, sep=sep))
+        tr_lists = train_df[col].apply(lambda v: _parse_multilabel_cell(v, sep=sep, col_name=col))
         if col in test_df.columns:
-            te_lists = test_df[col].apply(lambda v: _parse_multilabel_cell(v, sep=sep))
+            te_lists = test_df[col].apply(lambda v: _parse_multilabel_cell(v, sep=sep, col_name=col))
         else:
             te_lists = pd.Series([[] for _ in range(len(test_df))], index=test_df.index)
 
@@ -266,8 +309,6 @@ def expand_multilabel_columns(
         }
 
     return train_df, test_df, info
-
-    return s
 
 
 def apply_rare_bucket(
