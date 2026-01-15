@@ -10,7 +10,7 @@ sampler: tpe
 use_pruner: true
 pruner:
   name: median
-  n_warmup_steps: 10
+  n_warmup_steps: 1
 study_name: lgbm_tuning_f1
 storage: null             # null | "sqlite:///optuna_lgbm.db"
 search_space:
@@ -25,7 +25,7 @@ search_space:
   subsample: { low: 0.6, high: 1.0 }
   subsample_freq:
     choices: [0, 1, 2, 5]
-  feature_fraction: { low: 0.4, high: 1.0 }
+  colsample_bytree: { low: 0.4, high: 1.0 }
   max_bin:
     choices: [127, 255, 511]
   scale_pos_weight: { low: 1.0, high: 4.0, log: true }

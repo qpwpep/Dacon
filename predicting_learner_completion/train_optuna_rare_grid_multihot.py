@@ -728,7 +728,7 @@ def run_optuna_tuning(
       - min_split_gain
       - reg_alpha / reg_lambda
       - subsample / subsample_freq
-      - feature_fraction (mapped to colsample_bytree for LGBMClassifier)
+      - colsample_bytree
       - max_bin
       - scale_pos_weight
 
@@ -853,7 +853,7 @@ def run_optuna_tuning(
         reg_lambda = _ss_float("reg_lambda", 1e-3, 500.0, log=True)
         subsample = _ss_float("subsample", 0.6, 1.0, log=False)
         subsample_freq = _ss_cat("subsample_freq", [0, 1, 2, 5])
-        feature_fraction = _ss_float("feature_fraction", 0.4, 1.0, log=False)
+        colsample_bytree = _ss_float("colsample_bytree", 0.4, 1.0, log=False)
         max_bin = _ss_cat("max_bin", [127, 255, 511])
         scale_pos_weight = _ss_float("scale_pos_weight", 1.0, 4.0, log=True)
 
@@ -878,7 +878,7 @@ def run_optuna_tuning(
         params["subsample"] = float(subsample)
         params["subsample_freq"] = int(subsample_freq)
         # sklearn wrapper uses colsample_bytree; map "feature_fraction" -> "colsample_bytree"
-        params["colsample_bytree"] = float(feature_fraction)
+        params["colsample_bytree"] = float(colsample_bytree)
         params["max_bin"] = int(max_bin)
         params["scale_pos_weight"] = float(scale_pos_weight)
 
@@ -900,7 +900,7 @@ def run_optuna_tuning(
             model.fit(
                 X_tr, y_tr,
                 eval_set=[(X_va, y_va)],
-                eval_metric="auc",
+                eval_metric="average_precision",
                 callbacks=[
                     lgb.early_stopping(stopping_rounds=int(cfg.train.early_stopping_rounds), verbose=False),
                 ],
@@ -909,7 +909,7 @@ def run_optuna_tuning(
 
             proba_va = model.predict_proba(X_va, num_iteration=model.best_iteration_)[:, 1]
             oof[va_idx] = proba_va
-            seen_idx: List[int] = []
+            seen_idx.extend(list(va_idx))
             auc = roc_auc_score(y_va, proba_va)
             aucs.append(float(auc))
 
@@ -985,7 +985,7 @@ def run_optuna_tuning(
         "reg_lambda": float(best_params["reg_lambda"]),
         "subsample": float(best_params["subsample"]),
         "subsample_freq": int(best_params["subsample_freq"]),
-        "colsample_bytree": float(best_params["feature_fraction"]),  # maps feature_fraction -> colsample_bytree
+        "colsample_bytree": float(best_params["colsample_bytree"]),
         "max_bin": int(best_params["max_bin"]),
         "scale_pos_weight": float(best_params["scale_pos_weight"]),
     }
@@ -1028,7 +1028,8 @@ def run_optuna_tuning(
             "optuna/best_reg_lambda": overrides["reg_lambda"],
             "optuna/best_subsample": overrides["subsample"],
             "optuna/best_subsample_freq": overrides["subsample_freq"],
-            "optuna/best_feature_fraction": overrides["colsample_bytree"],
+            "optuna/best_colsample_bytree": overrides["colsample_bytree"],
+            "optuna/best_feature_fraction": overrides["colsample_bytree"],  # (옵션) 기존 대시보드 호환용
             "optuna/best_max_bin": overrides["max_bin"],
             "optuna/best_scale_pos_weight": overrides["scale_pos_weight"],
         })
@@ -1073,7 +1074,7 @@ def cv_train(
         model.fit(
             X_tr, y_tr,
             eval_set=[(X_va, y_va)],
-            eval_metric="auc",
+            eval_metric="average_precision",
             callbacks=[
                 lgb.early_stopping(stopping_rounds=int(cfg.train.early_stopping_rounds), verbose=False),
                 lgb.log_evaluation(period=int(cfg.train.log_period)),
