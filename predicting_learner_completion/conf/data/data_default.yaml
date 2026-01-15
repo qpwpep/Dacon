@@ -21,3 +21,28 @@ categorical_numeric:
   exclude:
   - ${data.target_col}
   - ${data.id_col}
+
+# Rare bucket: merge infrequent categories (freq < min_freq on train) into "__RARE__"
+rare_bucket:
+  enable: true
+  min_freq: 3
+  exclude:
+  - ${data.target_col}
+  - ${data.id_col}
+
+# Multi-label columns (comma-separated) -> multi-hot (top-K)
+multilabel:
+  enable: true
+  # columns that contain multiple labels in one cell (e.g., "A, B, C")
+  cols:
+    # - desired_job
+    - expected_domain
+    - desired_certificate
+    - onedayclass_topic
+  sep: ","
+  min_freq: 5     # keep tokens that appear >= min_freq in TRAIN
+  top_k: 50       # keep only the most frequent top_k tokens per column (set null for no limit)
+  add_other: true # <col>__ml_other: 1 if any token is outside vocab
+  add_count: true # <col>__ml_count: number of tokens
+  drop_original: true
+
