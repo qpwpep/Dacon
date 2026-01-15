@@ -721,10 +721,16 @@ def run_optuna_tuning(
     """Tune a few LightGBM hyperparameters with Optuna and return best overrides.
 
     Tuning params:
+      - learning_rate
+      - max_depth
       - num_leaves
       - min_child_samples
-      - reg_lambda
+      - min_split_gain
+      - reg_alpha / reg_lambda
+      - subsample / subsample_freq
       - feature_fraction (mapped to colsample_bytree for LGBMClassifier)
+      - max_bin
+      - scale_pos_weight
 
     Metric:
       - "auc" (default) : mean AUC over folds
@@ -748,6 +754,16 @@ def run_optuna_tuning(
     if metric not in ("auc", "f1"):
         raise ValueError(f"Unsupported optuna metric: {metric} (use 'auc' or 'f1')")
 
+    # What to use for pruning intermediate values:
+    # - "auc": report mean AUC over completed folds (stable)
+    # - "f1" : report partial OOF F1 (threshold-optimized) over completed folds
+    # - "auto": use "auc" when tuning metric is f1, otherwise use metric
+    prune_metric = str(getattr(optuna_cfg, "prune_metric", "auc")).lower()
+    if prune_metric == "auto":
+        prune_metric = "auc" if metric == "f1" else metric
+    if prune_metric not in ("auc", "f1"):
+        raise ValueError(f"Unsupported optuna prune_metric: {prune_metric} (use 'auc'|'f1'|'auto')")
+
     n_splits = int(getattr(optuna_cfg, "n_splits", int(cfg.train.n_splits)))
 
     sampler_name = str(getattr(optuna_cfg, "sampler", "tpe")).lower()
@@ -761,6 +777,11 @@ def run_optuna_tuning(
     pruner_cfg = getattr(optuna_cfg, "pruner", None)
     pruner_name = str(getattr(pruner_cfg, "name", "median")).lower() if pruner_cfg is not None else "median"
     n_warmup_steps = int(getattr(pruner_cfg, "n_warmup_steps", 10)) if pruner_cfg is not None else 10
+
+    # IMPORTANT: if warmup steps > number of folds, pruning never triggers.
+    # Cap warmup to n_splits so pruner can actually work.
+    if n_warmup_steps > n_splits:
+        n_warmup_steps = n_splits
 
     if not use_pruner or pruner_name == "nop":
         pruner = optuna.pruners.NopPruner()
@@ -813,16 +834,53 @@ def run_optuna_tuning(
             _log = bool(getattr(cfg_item, "log", log))
             return float(trial.suggest_float(name, _low, _high, log=_log))
 
-        num_leaves = _ss_int("num_leaves", 16, 256, log=True)
-        min_child_samples = _ss_int("min_child_samples", 10, 200, log=True)
-        reg_lambda = _ss_float("reg_lambda", 1e-3, 100.0, log=True)
-        feature_fraction = _ss_float("feature_fraction", 0.5, 1.0, log=False)
+        def _ss_cat(name: str, choices: List[Any]) -> Any:
+            """Categorical search space with optional YAML override: {choices: [...]}"""
+            if ss is None or not hasattr(ss, name):
+                return trial.suggest_categorical(name, choices)
+            cfg_item = getattr(ss, name)
+            _choices = list(getattr(cfg_item, "choices", choices))
+            if not _choices:
+                _choices = choices
+            return trial.suggest_categorical(name, _choices)
 
+        learning_rate = _ss_float("learning_rate", 0.01, 0.15, log=True)
+        max_depth = _ss_cat("max_depth", [-1, 4, 6, 8, 10, 12, 16])
+        num_leaves = _ss_int("num_leaves", 16, 256, log=True)
+        min_child_samples = _ss_int("min_child_samples", 5, 400, log=True)
+        min_split_gain = _ss_float("min_split_gain", 1e-8, 1.0, log=True)
+        reg_alpha = _ss_float("reg_alpha", 1e-8, 10.0, log=True)
+        reg_lambda = _ss_float("reg_lambda", 1e-3, 500.0, log=True)
+        subsample = _ss_float("subsample", 0.6, 1.0, log=False)
+        subsample_freq = _ss_cat("subsample_freq", [0, 1, 2, 5])
+        feature_fraction = _ss_float("feature_fraction", 0.4, 1.0, log=False)
+        max_bin = _ss_cat("max_bin", [127, 255, 511])
+        scale_pos_weight = _ss_float("scale_pos_weight", 1.0, 4.0, log=True)
+
+        # mild constraint: if max_depth is limited, cap num_leaves to 2^max_depth
+        if int(max_depth) > 0:
+            max_leaves = int(2 ** int(max_depth))
+            num_leaves = int(min(int(num_leaves), max_leaves))
+
+        # bagging only makes sense when subsample < 1.0
+        if float(subsample) >= 0.999:
+            subsample_freq = 0
+        else:
+            subsample_freq = int(max(1, int(subsample_freq)))
+
+        params["learning_rate"] = float(learning_rate)
+        params["max_depth"] = int(max_depth)
         params["num_leaves"] = int(num_leaves)
         params["min_child_samples"] = int(min_child_samples)
+        params["min_split_gain"] = float(min_split_gain)
+        params["reg_alpha"] = float(reg_alpha)
         params["reg_lambda"] = float(reg_lambda)
+        params["subsample"] = float(subsample)
+        params["subsample_freq"] = int(subsample_freq)
         # sklearn wrapper uses colsample_bytree; map "feature_fraction" -> "colsample_bytree"
         params["colsample_bytree"] = float(feature_fraction)
+        params["max_bin"] = int(max_bin)
+        params["scale_pos_weight"] = float(scale_pos_weight)
 
         skf = StratifiedKFold(
             n_splits=n_splits,
@@ -832,6 +890,7 @@ def run_optuna_tuning(
 
         aucs: List[float] = []
         oof = np.zeros(len(X), dtype=float)
+        seen_idx: List[int] = []
 
         for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y), start=1):
             X_tr, y_tr = X.iloc[tr_idx], y.iloc[tr_idx]
@@ -850,11 +909,37 @@ def run_optuna_tuning(
 
             proba_va = model.predict_proba(X_va, num_iteration=model.best_iteration_)[:, 1]
             oof[va_idx] = proba_va
+            seen_idx: List[int] = []
             auc = roc_auc_score(y_va, proba_va)
             aucs.append(float(auc))
 
-            # pruning on AUC is stable even if final metric is f1
-            trial.report(float(np.mean(aucs)), step=fold)
+            # ---- Pruning: report intermediate value per fold ----
+            if prune_metric == "auc":
+                intermediate = float(np.mean(aucs))
+            else:
+                # prune_metric == "f1": partial OOF F1 over completed folds only
+                try:
+                    y_part = y.values[seen_idx]
+                    p_part = oof[seen_idx]
+                    if bool(cfg.train.optimize_threshold.enable):
+                        t_part, f1_part = search_best_threshold(
+                            y_true=y_part,
+                            proba=p_part,
+                            method=str(_select(cfg, "train.optimize_threshold.method", "pr_curve")),
+                            min_t=float(cfg.train.optimize_threshold.clamp_min),
+                            max_t=float(cfg.train.optimize_threshold.clamp_max),
+                            grid_start=float(_select(cfg, "train.optimize_threshold.grid.start", _select(cfg, "train.optimize_threshold.grid_start", 0.05))),
+                            grid_end=float(_select(cfg, "train.optimize_threshold.grid.end", _select(cfg, "train.optimize_threshold.grid_end", 0.95))),
+                            grid_step=float(_select(cfg, "train.optimize_threshold.grid.step", _select(cfg, "train.optimize_threshold.grid_step", 0.01))),
+                        )
+                        intermediate = float(f1_part)
+                    else:
+                        thr = float(cfg.train.threshold)
+                        intermediate = float(f1_score(y_part, (p_part >= thr).astype(int)))
+                except Exception:
+                    intermediate = float("nan")
+
+            trial.report(intermediate, step=fold)
             if use_pruner and trial.should_prune():
                 raise optuna.TrialPruned()
 
@@ -891,10 +976,18 @@ def run_optuna_tuning(
 
     # rename for config override usage
     overrides = {
+        "learning_rate": float(best_params["learning_rate"]),
+        "max_depth": int(best_params["max_depth"]),
         "num_leaves": int(best_params["num_leaves"]),
         "min_child_samples": int(best_params["min_child_samples"]),
+        "min_split_gain": float(best_params["min_split_gain"]),
+        "reg_alpha": float(best_params["reg_alpha"]),
         "reg_lambda": float(best_params["reg_lambda"]),
+        "subsample": float(best_params["subsample"]),
+        "subsample_freq": int(best_params["subsample_freq"]),
         "colsample_bytree": float(best_params["feature_fraction"]),  # maps feature_fraction -> colsample_bytree
+        "max_bin": int(best_params["max_bin"]),
+        "scale_pos_weight": float(best_params["scale_pos_weight"]),
     }
 
     # Persist best trial params into outputs/.../best_params.yaml
@@ -926,10 +1019,18 @@ def run_optuna_tuning(
         # single log entry for best
         wandb_log(run, {
             "optuna/best_value": float(best.value),
+            "optuna/best_learning_rate": overrides["learning_rate"],
+            "optuna/best_max_depth": overrides["max_depth"],
             "optuna/best_num_leaves": overrides["num_leaves"],
             "optuna/best_min_child_samples": overrides["min_child_samples"],
+            "optuna/best_min_split_gain": overrides["min_split_gain"],
+            "optuna/best_reg_alpha": overrides["reg_alpha"],
             "optuna/best_reg_lambda": overrides["reg_lambda"],
+            "optuna/best_subsample": overrides["subsample"],
+            "optuna/best_subsample_freq": overrides["subsample_freq"],
             "optuna/best_feature_fraction": overrides["colsample_bytree"],
+            "optuna/best_max_bin": overrides["max_bin"],
+            "optuna/best_scale_pos_weight": overrides["scale_pos_weight"],
         })
 
     return overrides

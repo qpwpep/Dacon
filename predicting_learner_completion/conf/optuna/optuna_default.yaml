@@ -14,6 +14,12 @@ timeout: null        # seconds, or null
 # Use a lighter CV during tuning (final training can still use train.n_splits)
 n_splits: 3
 
+# Intermediate metric used for pruning:
+# - auc  : stable pruning even if final metric is f1
+# - f1   : prune using partial OOF F1 (threshold-optimized)
+# - auto : auc when metric=f1 else metric
+prune_metric: auc
+
 # Reproducibility
 seed: ${train.seed}
 
@@ -22,7 +28,7 @@ sampler: tpe         # tpe | random
 use_pruner: true
 pruner:
   name: median       # median | hyperband | nop
-  n_warmup_steps: 10 # used for median/hyperband
+  n_warmup_steps: 1 # used for median/hyperband # MUST be <= n_splits to actually prune
 
 # Optional: persist study to resume
 study_name: lgbm_tuning
@@ -30,18 +36,43 @@ storage: null        # e.g. "sqlite:///optuna_lgbm.db"
 
 # Search space (these map to LGBMClassifier params)
 search_space:
+  learning_rate:
+    low: 1.0e-2
+    high: 1.5e-1
+    log: true
+  max_depth:
+    choices: [-1, 4, 6, 8, 10, 12, 16]
   num_leaves:
     low: 16
     high: 256
     log: true
   min_child_samples:
-    low: 10
-    high: 200
+    low: 5
+    high: 400
+    log: true
+  min_split_gain:
+    low: 1.0e-8
+    high: 1.0
+    log: true
+  reg_alpha:
+    low: 1.0e-8
+    high: 10.0
     log: true
   reg_lambda:
     low: 1.0e-3
-    high: 100.0
+    high: 500.0
     log: true
-  feature_fraction:
-    low: 0.5
+  subsample:
+    low: 0.6
     high: 1.0
+  subsample_freq:
+    choices: [0, 1, 2, 5]
+  feature_fraction:
+    low: 0.4
+    high: 1.0
+  max_bin:
+    choices: [127, 255, 511]
+  scale_pos_weight:
+    low: 1.0
+    high: 4.0
+    log: true

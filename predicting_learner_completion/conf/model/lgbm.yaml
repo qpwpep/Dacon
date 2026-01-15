@@ -6,6 +6,7 @@ n_estimators: 5000        # used for early-stopping; final n_estimators will be 
 num_leaves: 63
 max_depth: -1
 min_child_samples: 20
+min_split_gain: 0.0
 
 subsample: 0.8
 subsample_freq: 1
@@ -13,6 +14,10 @@ colsample_bytree: 0.8
 
 reg_alpha: 0.1
 reg_lambda: 1.0
+
+max_bin: 255
+scale_pos_weight: 1.0
+feature_fraction: 0.8
 
 random_state: ${train.seed}
 seed: ${train.seed}
