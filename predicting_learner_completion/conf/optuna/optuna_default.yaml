@@ -67,7 +67,7 @@ search_space:
     high: 1.0
   subsample_freq:
     choices: [0, 1, 2, 5]
-  feature_fraction:
+  colsample_bytree:
     low: 0.4
     high: 1.0
   max_bin:

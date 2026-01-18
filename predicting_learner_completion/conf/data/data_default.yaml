@@ -17,6 +17,7 @@ categorical_numeric:
   enable: true
   max_unique: 150          # include coded columns like school1, class1...
   include_bool: true       # whether to include bool cols as categorical
+  skip_binary_numeric: true
   # columns that should never be converted to categorical
   exclude:
   - ${data.target_col}
@@ -29,20 +30,29 @@ rare_bucket:
   exclude:
   - ${data.target_col}
   - ${data.id_col}
+  - incumbents_lecture_scale_reason
+  - onedayclass_topic
 
 # Multi-label columns (comma-separated) -> multi-hot (top-K)
 multilabel:
   enable: true
   # columns that contain multiple labels in one cell (e.g., "A, B, C")
   cols:
-    # - desired_job
+    - desired_job
+    - desired_job_except_data
+    - certificate_acquisition
+    - major_field
+    - interested_company
     - expected_domain
     - desired_certificate
     - onedayclass_topic
   sep: ","
-  min_freq: 5     # keep tokens that appear >= min_freq in TRAIN
-  top_k: 50       # keep only the most frequent top_k tokens per column (set null for no limit)
+  min_freq: 3     # keep tokens that appear >= min_freq in TRAIN
+  top_k: null       # keep only the most frequent top_k tokens per column (set null for no limit)
   add_other: true # <col>__ml_other: 1 if any token is outside vocab
   add_count: true # <col>__ml_count: number of tokens
   drop_original: true
+  # 멀티라벨로 생성된 멀티핫/카운트/other 컬럼은 categorical 후보에서 제외
+  exclude_generated_from_categorical_numeric: true
+  exclude_generated_from_categorical_cols: true
 
