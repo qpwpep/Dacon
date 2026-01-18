@@ -11,19 +11,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-import pandas as pd
+import numpy as np # type: ignore
+import pandas as pd # type: ignore
 
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score, f1_score, precision_recall_curve
-from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.model_selection import StratifiedKFold # type: ignore
+from sklearn.metrics import roc_auc_score, f1_score, precision_recall_curve # type: ignore
+from sklearn.preprocessing import MultiLabelBinarizer # type: ignore
 
-import lightgbm as lgb
+import lightgbm as lgb # type: ignore
 
-import hydra
-from hydra.utils import to_absolute_path
-from hydra.core.hydra_config import HydraConfig
-from omegaconf import DictConfig, OmegaConf
+import hydra # type: ignore
+from hydra.utils import to_absolute_path # type: ignore
+from hydra.core.hydra_config import HydraConfig # type: ignore
+from omegaconf import DictConfig, OmegaConf # type: ignore
 
 
 def seed_everything(seed: int) -> None:
@@ -346,7 +346,7 @@ def apply_rare_bucket(
         tr = tr.where(tr.notna(), "__MISSING__").astype(str)
 
         vc = tr.value_counts(dropna=False)
-        rare_vals = vc[vc < int(min_freq)].index.astype(str).tolist()
+        rare_vals = vc[vc < int(min_freq)].index.astype(str).tolist() # type: ignore
         rare_vals = [v for v in rare_vals if v != "__MISSING__"]  # 결측 토큰은 유지
 
         if rare_vals:
@@ -402,7 +402,7 @@ def drop_constant_cols(
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     """train 기준 nunique<=1 인 상수 컬럼 드랍."""
     nunique = train_df.nunique(dropna=False)
-    const_cols = nunique[nunique <= 1].index.tolist()
+    const_cols = nunique[nunique <= 1].index.tolist() # type: ignore
     return train_df.drop(columns=const_cols), test_df.drop(columns=const_cols, errors="ignore"), const_cols
 
 
@@ -533,7 +533,7 @@ def preprocess_fold_fit(
         if other is None:
             X_tr, _, multilabel_info = expand_multilabel_columns(
                 train_df=X_tr,
-                test_df=X_tr.iloc[0:0].copy(),
+                test_df=X_tr.iloc[0:0].copy(), # type: ignore
                 cols=ml_cols,
                 sep=str(_select(cfg, "data.multilabel.sep", ",")),
                 min_freq=int(_select(cfg, "data.multilabel.min_freq", 3)),
@@ -567,7 +567,7 @@ def preprocess_fold_fit(
 
     if other is None:
         X_tr, _, dropped_missing = drop_high_missing_cols(
-            X_tr, X_tr.iloc[0:0].copy(), threshold=float(cfg.data.drop_missing_threshold)
+            X_tr, X_tr.iloc[0:0].copy(), threshold=float(cfg.data.drop_missing_threshold) # type: ignore
         )
     else:
         X_tr, other, dropped_missing = drop_high_missing_cols(
@@ -576,7 +576,7 @@ def preprocess_fold_fit(
 
     if bool(cfg.data.drop_constant_cols):
         if other is None:
-            X_tr, _, dropped_const = drop_constant_cols(X_tr, X_tr.iloc[0:0].copy())
+            X_tr, _, dropped_const = drop_constant_cols(X_tr, X_tr.iloc[0:0].copy()) # type: ignore
         else:
             X_tr, other, dropped_const = drop_constant_cols(X_tr, other)
 
@@ -614,7 +614,7 @@ def preprocess_fold_fit(
         if other is None:
             X_tr, _, rare_info = apply_rare_bucket(
                 train_df=X_tr,
-                test_df=X_tr.iloc[0:0].copy(),
+                test_df=X_tr.iloc[0:0].copy(), # type: ignore
                 categorical_cols=cat_cols,
                 min_freq=min_freq,
                 exclude_cols=exclude_cols,
@@ -632,7 +632,7 @@ def preprocess_fold_fit(
     categories_map: Dict[str, List[str]] = {}
     if other is None:
         X_tr, _, cat_cols, categories_map = make_categorical_safe(
-            X_tr, X_tr.iloc[0:0].copy(), categorical_cols=cat_cols
+            X_tr, X_tr.iloc[0:0].copy(), categorical_cols=cat_cols # type: ignore
         )
     else:
         X_tr, other, cat_cols, categories_map = make_categorical_safe(
@@ -685,7 +685,7 @@ def preprocess_fold_fit(
             "categories_map_summary": cat_summary,
         }
 
-    return X_tr, X_va_p, test_p, cat_cols, meta
+    return X_tr, X_va_p, test_p, cat_cols, meta # type: ignore
 
 
 
@@ -694,7 +694,7 @@ def maybe_init_wandb(cfg: DictConfig):
         return None
 
     try:
-        import wandb
+        import wandb # type: ignore
 
         run = wandb.init(
             project=cfg.wandb.project,
@@ -715,7 +715,7 @@ def maybe_init_wandb(cfg: DictConfig):
 def wandb_log(run, payload: Dict[str, Any], step: Optional[int] = None) -> None:
     if run is None:
         return
-    import wandb
+    import wandb # type: ignore
 
     wandb.log(payload, step=step)
 
@@ -826,7 +826,7 @@ def make_repro_bundle_path(model_path: Path, cfg: DictConfig, run, kind: str, ts
 def wandb_log_artifact(run, path: Path, name: str, art_type: str) -> None:
     if run is None:
         return
-    import wandb
+    import wandb # type: ignore
 
     art = wandb.Artifact(name=name, type=art_type)
     art.add_file(str(path))
@@ -953,7 +953,7 @@ def run_optuna_tuning(
         return {}
 
     try:
-        import optuna
+        import optuna # type: ignore
     except ImportError as e:
         raise ImportError("Optuna is not installed. Run: pip install optuna") from e
 
@@ -1023,7 +1023,7 @@ def run_optuna_tuning(
             X_tr_raw, y_tr = X_raw.iloc[tr_idx], y.iloc[tr_idx]
             X_va_raw, y_va = X_raw.iloc[va_idx], y.iloc[va_idx]
             X_tr, X_va, _, cat_cols, _ = preprocess_fold_fit(cfg, X_tr_raw, X_va_raw, None, return_meta=False)
-            fold_cache.append((X_tr, y_tr, X_va, y_va, cat_cols))
+            fold_cache.append((X_tr, y_tr, X_va, y_va, cat_cols)) # type: ignore
 
     def objective(trial: "optuna.Trial") -> float:
         params = dict(base_params)
@@ -1829,7 +1829,7 @@ def main(cfg: DictConfig) -> None:
 
 
         else:
-            booster = final_model.booster_
+            booster = final_model.booster_ # type: ignore
             model_path.parent.mkdir(parents=True, exist_ok=True)
             booster.save_model(str(model_path))
             print("Saved model:", model_path)
@@ -1895,14 +1895,14 @@ def main(cfg: DictConfig) -> None:
             if use_fold_ensemble:
                 importances = cv_feat_imp
             else:
-                importances = final_model.feature_importances_
+                importances = final_model.feature_importances_ # type: ignore
 
             fi = pd.DataFrame({
                 "feature": X_full.columns,
                 "importance": importances,
             }).sort_values("importance", ascending=False)
             try:
-                import wandb
+                import wandb # type: ignore
                 table = wandb.Table(dataframe=fi.head(200))
                 wandb.log({"feature_importance_top200": table})
             except Exception as e:
@@ -1937,4 +1937,4 @@ def main(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main() # type: ignore
