@@ -371,9 +371,121 @@ def apply_rare_bucket(
 
     return train_df, test_df, info
 
+
+# "4-1" / "4/2" / "4학년 1학기" 같은 표기를 학기수로 환산(선택)
+_GRADE_TERM_RE = re.compile(r"^\s*(\d)\s*[-/]\s*([12])\s*$")
+_GRADE_TERM_KO_RE = re.compile(r"^\s*(\d)\s*학년\s*([12])\s*학기\s*$")
+
+def clean_completed_semester_series(
+    s: pd.Series,
+    min_val: int = 0,
+    max_val: int = 20,
+) -> tuple[pd.Series, pd.Series]:
+    """
+    completed_semester 정제:
+    - 정상 범위(min_val~max_val)의 '정수 학기수'만 남김
+    - 연도/학기 형태(예: 2020.02, 20241)나 비정상 값은 NaN 처리
+    - 대신 invalid flag 피처를 생성
+    """
+    raw = s.copy()
+    invalid = pd.Series(0, index=s.index, dtype="int8")
+
+    def _parse_one(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return np.nan, 0
+
+        # 숫자형 처리
+        if isinstance(v, (int, np.integer)):
+            x = float(v)
+        elif isinstance(v, (float, np.floating)):
+            x = float(v)
+        else:
+            ss = str(v).strip()
+            if ss == "":
+                return np.nan, 0
+
+            # "8학기" / "8 학기" -> 8
+            ss2 = re.sub(r"\s+", "", ss)
+            m = re.match(r"^(\d{1,2})학기$", ss2)
+            if m:
+                x = float(m.group(1))
+            else:
+                # "4-1" 같은 표기 -> (4-1)*2+1 = 7
+                m2 = _GRADE_TERM_RE.match(ss2)
+                if m2:
+                    g = int(m2.group(1))
+                    t = int(m2.group(2))
+                    # 학년이 1~6 정도인 경우만 유효 처리
+                    if 1 <= g <= 6 and t in (1, 2):
+                        x = float((g - 1) * 2 + t)
+                    else:
+                        return np.nan, 1
+                else:
+                    m3 = _GRADE_TERM_KO_RE.match(ss2)
+                    if m3:
+                        g = int(m3.group(1))
+                        t = int(m3.group(2))
+                        if 1 <= g <= 6 and t in (1, 2):
+                            x = float((g - 1) * 2 + t)
+                        else:
+                            return np.nan, 1
+                    else:
+                        # 일반 숫자 변환 시도 ("8", "8.0" 등)
+                        try:
+                            x = float(ss2)
+                        except Exception:
+                            return np.nan, 1
+
+        # 여기부터 “이상치 컷”
+        # 1000 이상은 대부분 연도/학기 입력으로 보고 NaN
+        if x >= 1000:
+            return np.nan, 1
+
+        # 정상 범위 밖이면 NaN(또는 clip로 바꿀 수도 있음)
+        if x < min_val or x > max_val:
+            return np.nan, 1
+
+        # 정수에 가까우면 반올림해서 int로
+        xr = int(round(x))
+        if abs(x - xr) > 1e-6:
+            # 8.3 같은 애매한 값은 NaN 처리
+            return np.nan, 1
+
+        return float(xr), 0
+
+    cleaned_vals = []
+    invalid_flags = []
+
+    for v in raw.tolist():
+        cv, iv = _parse_one(v)
+        cleaned_vals.append(cv)
+        invalid_flags.append(iv)
+
+    cleaned = pd.Series(cleaned_vals, index=s.index, dtype="float32")
+    invalid = pd.Series(invalid_flags, index=s.index, dtype="int8")
+
+    return cleaned, invalid
+
+
+
+
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """대회 컬럼 구성에 맞춘 최소 파생피처."""
     df = df.copy()
+
+    # ✅ completed_semester 정제 + invalid flag
+    if "completed_semester" in df.columns:
+        cleaned, invalid = clean_completed_semester_series(df["completed_semester"], min_val=0, max_val=20)
+        df["completed_semester"] = cleaned
+        df["completed_semester_invalid"] = invalid
+
+        # (선택) 버킷 피처: 너무 과하면 빼도 됨
+        # df["completed_semester_bucket"] = pd.cut(
+        #     df["completed_semester"],
+        #     bins=[-0.1, 2, 4, 6, 8, 10, 20],
+        #     labels=["0-2", "3-4", "5-6", "7-8", "9-10", "11+"],
+        # ).astype("object")
 
     # major_field 기반 파생피처 (존재할 때만)
     if "major_field" in df.columns:
@@ -696,7 +808,7 @@ def maybe_init_wandb(cfg: DictConfig):
     try:
         import wandb # type: ignore
 
-        run = wandb.init(
+        run = wandb.init( # type: ignore
             project=cfg.wandb.project,
             entity=cfg.wandb.entity,
             mode=cfg.wandb.mode,
@@ -717,7 +829,7 @@ def wandb_log(run, payload: Dict[str, Any], step: Optional[int] = None) -> None:
         return
     import wandb # type: ignore
 
-    wandb.log(payload, step=step)
+    wandb.log(payload, step=step) # type: ignore
 
 
 
@@ -828,7 +940,7 @@ def wandb_log_artifact(run, path: Path, name: str, art_type: str) -> None:
         return
     import wandb # type: ignore
 
-    art = wandb.Artifact(name=name, type=art_type)
+    art = wandb.Artifact(name=name, type=art_type) # type: ignore
     art.add_file(str(path))
     run.log_artifact(art)
 
@@ -1297,7 +1409,7 @@ def cv_train_foldfit(
         X_tr_raw, y_tr = X_raw.iloc[tr_idx], y.iloc[tr_idx]
         X_va_raw, y_va = X_raw.iloc[va_idx], y.iloc[va_idx]
 
-        # ✅ fold-fit 전처리 (rare/vocab/category map은 train-fold에서만 생성)
+        # fold-fit 전처리 (rare/vocab/category map은 train-fold에서만 생성)
         X_tr, X_va, test_fold, cat_cols, fold_meta = preprocess_fold_fit(
             cfg,
             X_tr_raw,
@@ -1318,9 +1430,12 @@ def cv_train_foldfit(
         model.fit(
             X_tr, y_tr,
             eval_set=[(X_va, y_va)],
-            eval_metric="average_precision",
+            eval_metric="binary_logloss",  # or ["binary_logloss", "auc"]
             callbacks=[
-                lgb.early_stopping(stopping_rounds=int(cfg.train.early_stopping_rounds), verbose=False),
+                lgb.early_stopping(
+                    stopping_rounds=int(cfg.train.early_stopping_rounds),
+                    verbose=False,
+                    first_metric_only=True,), # early stopping은 첫 metric(logloss)로만
                 lgb.log_evaluation(period=int(cfg.train.log_period)),
             ],
             categorical_feature=cat_cols if len(cat_cols) > 0 else "auto",
@@ -1903,8 +2018,8 @@ def main(cfg: DictConfig) -> None:
             }).sort_values("importance", ascending=False)
             try:
                 import wandb # type: ignore
-                table = wandb.Table(dataframe=fi.head(200))
-                wandb.log({"feature_importance_top200": table})
+                table = wandb.Table(dataframe=fi.head(200)) # type: ignore
+                wandb.log({"feature_importance_top200": table}) # type: ignore
             except Exception as e:
                 print(f"[Warn] feature importance logging failed: {e}")
 

@@ -1413,7 +1413,7 @@ def main(cfg: DictConfig) -> None:
             "best_f1": float(best_f1),
             "auc_mean": float(auc_mean),
             "auc_std": float(auc_std),
-            "f1_mean_at_thr": float(f1_mean),
+            "cv_f1_mean_bestthr": float(f1_mean),
             "f1_std_at_thr": float(f1_std),
             "best_iter_final": int(best_iter_final),
             "threshold_mode": "optimized" if bool(cfg.train.optimize_threshold.enable) else "fixed",

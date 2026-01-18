@@ -22,6 +22,8 @@ categorical_numeric:
   exclude:
   - ${data.target_col}
   - ${data.id_col}
+  - time_input
+  - completed_semester
 
 # Rare bucket: merge infrequent categories (freq < min_freq on train) into "__RARE__"
 rare_bucket:
@@ -30,8 +32,6 @@ rare_bucket:
   exclude:
   - ${data.target_col}
   - ${data.id_col}
-  - incumbents_lecture_scale_reason
-  - onedayclass_topic
 
 # Multi-label columns (comma-separated) -> multi-hot (top-K)
 multilabel:
@@ -48,7 +48,7 @@ multilabel:
     - onedayclass_topic
   sep: ","
   min_freq: 3     # keep tokens that appear >= min_freq in TRAIN
-  top_k: null       # keep only the most frequent top_k tokens per column (set null for no limit)
+  top_k: 50       # keep only the most frequent top_k tokens per column (set null for no limit)
   add_other: true # <col>__ml_other: 1 if any token is outside vocab
   add_count: true # <col>__ml_count: number of tokens
   drop_original: true
