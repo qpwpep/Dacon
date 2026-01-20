@@ -29,6 +29,8 @@ use_pruner: true
 pruner:
   name: median       # median | hyperband | nop
   n_warmup_steps: 1 # used for median/hyperband # MUST be <= n_splits to actually prune
+  # min_resource: 1
+  # max_resource: 'auto'
 
 # Optional: persist study to resume
 study_name: lgbm_tuning
@@ -72,7 +74,3 @@ search_space:
     high: 1.0
   max_bin:
     choices: [127, 255, 511]
-  scale_pos_weight:
-    low: 1.0
-    high: 4.0
-    log: true

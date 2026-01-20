@@ -19,6 +19,7 @@ from sklearn.metrics import roc_auc_score, f1_score, precision_recall_curve # ty
 from sklearn.preprocessing import MultiLabelBinarizer # type: ignore
 
 import lightgbm as lgb # type: ignore
+from catboost import CatBoostClassifier # type: ignore
 
 import hydra # type: ignore
 from hydra.utils import to_absolute_path # type: ignore
@@ -909,6 +910,14 @@ def collect_run_info(cfg: DictConfig, run) -> Dict[str, Any]:
         "run_id": str(getattr(run, "id", "")) if run is not None else "local",
     }
 
+    catboost_version = None
+    try:
+        if CatBoostClassifier is not None:
+            import catboost  # type: ignore
+            catboost_version = getattr(catboost, "__version__", None)
+    except Exception:
+        catboost_version = None
+
     info: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(),
         "seed": int(getattr(cfg.train, "seed", 0)),
@@ -920,6 +929,7 @@ def collect_run_info(cfg: DictConfig, run) -> Dict[str, Any]:
         },
         "platform": platform.platform(),
         "lightgbm_version": getattr(lgb, "__version__", None),
+        "catboost_version": catboost_version,
         "git": get_git_info(repo_dir),
     }
     return info
@@ -981,31 +991,45 @@ def search_best_threshold(
     if method == "grid":
         start = float(max(min_t, grid_start))
         end = float(min(max_t, grid_end))
-        step = float(grid_step) if grid_step is not None else 0.01
-        if step <= 0:
-            step = 0.01
 
-        thresholds = np.arange(start, end + 1e-12, step, dtype=float)
-        if thresholds.size == 0:
+        # 1) coarse grid (더 큰 간격으로 전체 탐색)
+        coarse_step = max(float(grid_step), 0.02)  # 예: 최소 0.02
+        coarse_thr = np.arange(start, end + 1e-12, coarse_step, dtype=float)
+
+        if coarse_thr.size == 0:
             t = float(np.clip(0.5, min_t, max_t))
             return t, float(f1_score(y_true, (proba >= t).astype(int)))
 
         y_pos = (y_true == 1)
-
-        # (n_samples, n_thr) boolean matrix
-        preds = (proba[:, None] >= thresholds[None, :])
-
+        preds = (proba[:, None] >= coarse_thr[None, :])
         tp = np.sum(preds & y_pos[:, None], axis=0).astype(float)
         fp = np.sum(preds & (~y_pos)[:, None], axis=0).astype(float)
         fn = np.sum((~preds) & y_pos[:, None], axis=0).astype(float)
-
         prec = tp / (tp + fp + 1e-15)
         rec = tp / (tp + fn + 1e-15)
         f1s = 2.0 * prec * rec / (prec + rec + 1e-15)
 
         best_idx = int(np.nanargmax(f1s))
-        best_t = float(thresholds[best_idx])
-        best_f1 = float(f1s[best_idx])
+        best_t_coarse = float(coarse_thr[best_idx])
+
+        # 2) fine grid (coarse 최적점 주변만 촘촘히 재탐색)
+        fine_step = min(float(grid_step), 0.002)   # 예: 최대 0.002까지 촘촘히
+        win = 3 * coarse_step                      # 주변 탐색 폭
+        fine_start = float(max(start, best_t_coarse - win))
+        fine_end   = float(min(end,   best_t_coarse + win))
+        fine_thr = np.arange(fine_start, fine_end + 1e-12, fine_step, dtype=float)
+
+        preds2 = (proba[:, None] >= fine_thr[None, :])
+        tp2 = np.sum(preds2 & y_pos[:, None], axis=0).astype(float)
+        fp2 = np.sum(preds2 & (~y_pos)[:, None], axis=0).astype(float)
+        fn2 = np.sum((~preds2) & y_pos[:, None], axis=0).astype(float)
+        prec2 = tp2 / (tp2 + fp2 + 1e-15)
+        rec2 = tp2 / (tp2 + fn2 + 1e-15)
+        f1s2 = 2.0 * prec2 * rec2 / (prec2 + rec2 + 1e-15)
+
+        best_idx2 = int(np.nanargmax(f1s2))
+        best_t = float(fine_thr[best_idx2])
+        best_f1 = float(f1s2[best_idx2])
         return best_t, best_f1
 
     # ---------- pr_curve (default) ----------
@@ -1315,7 +1339,6 @@ def run_optuna_tuning(
         "subsample_freq": int(best_params["subsample_freq"]),
         "colsample_bytree": float(best_params["colsample_bytree"]),
         "max_bin": int(best_params["max_bin"]),
-        "scale_pos_weight": float(best_params["scale_pos_weight"]),
     }
 
     best_threshold = None
@@ -1359,7 +1382,6 @@ def run_optuna_tuning(
             "optuna/best_colsample_bytree": overrides["colsample_bytree"],
             "optuna/best_feature_fraction": overrides["colsample_bytree"],
             "optuna/best_max_bin": overrides["max_bin"],
-            "optuna/best_scale_pos_weight": overrides["scale_pos_weight"],
             "optuna/foldfit_preprocess": 1,
         })
 
@@ -1387,19 +1409,45 @@ def cv_train_foldfit(
 
     params = dict(OmegaConf.to_container(cfg.model, resolve=True))
 
+    # --- CatBoost (submodel) + Ensemble weight search config ---
+    cb_enable = bool(_select(cfg, "train.catboost.enable", False))
+    ens_enable = bool(_select(cfg, "train.ensemble.enable", True)) if cb_enable else False
+    weight_search_enable = bool(_select(cfg, "train.ensemble.weight_search.enable", True)) if ens_enable else False
+
+    # If user enabled CatBoost but package isn't installed -> fail fast
+    if cb_enable and CatBoostClassifier is None:
+        raise ImportError(
+            "CatBoost is enabled (train.catboost.enable=true) but catboost is not installed. "
+            "Run: pip install catboost"
+        )
+
     skf = StratifiedKFold(
         n_splits=int(cfg.train.n_splits),
         shuffle=True,
         random_state=int(cfg.train.seed),
     )
 
-    oof_proba = np.zeros(len(X_raw), dtype=float)
-    test_proba_sum = np.zeros(len(test_raw), dtype=float)  # fold별 test proba 누적
+    # Base(LGB) OOF/test proba
+    oof_lgb = np.zeros(len(X_raw), dtype=float)
+    test_sum_lgb = np.zeros(len(test_raw), dtype=float)
+
+    # Sub(Cat) OOF/test proba (optional)
+    oof_cb = np.zeros(len(X_raw), dtype=float) if cb_enable else None
+    test_sum_cb = np.zeros(len(test_raw), dtype=float) if cb_enable else None
 
     # feature importance: name 기반 누적
     feat_imp_sum: Dict[str, float] = {}
 
     best_iters: List[int] = []
+    # We'll compute fold metrics for returned model:
+    # - if ensemble enabled -> blended metrics (computed after best weight is found)
+    # - else -> LGB metrics
+    aucs_lgb: List[float] = []
+    f1s_lgb: List[float] = []
+    aucs_cb: List[float] = []
+    f1s_cb: List[float] = []
+    fold_va_indices: List[np.ndarray] = []  # for recomputing blended fold metrics after weight search
+
     aucs: List[float] = []
     f1s: List[float] = []
     fold_model_paths: List[Path] = []
@@ -1408,6 +1456,7 @@ def cv_train_foldfit(
     for fold, (tr_idx, va_idx) in enumerate(skf.split(X_raw, y), start=1):
         X_tr_raw, y_tr = X_raw.iloc[tr_idx], y.iloc[tr_idx]
         X_va_raw, y_va = X_raw.iloc[va_idx], y.iloc[va_idx]
+        fold_va_indices.append(np.asarray(va_idx))
 
         # fold-fit 전처리 (rare/vocab/category map은 train-fold에서만 생성)
         X_tr, X_va, test_fold, cat_cols, fold_meta = preprocess_fold_fit(
@@ -1426,6 +1475,9 @@ def cv_train_foldfit(
             except Exception as e:
                 print(f"[Warn] saving fold preprocess meta failed (fold={fold}): {e}")
 
+        # -------------------
+        # 1) LightGBM
+        # -------------------
         model = lgb.LGBMClassifier(**params)
         model.fit(
             X_tr, y_tr,
@@ -1441,13 +1493,12 @@ def cv_train_foldfit(
             categorical_feature=cat_cols if len(cat_cols) > 0 else "auto",
         )
 
-        # OOF
-        proba_va = model.predict_proba(X_va, num_iteration=model.best_iteration_)[:, 1]
-        oof_proba[va_idx] = proba_va
+        proba_va_lgb = model.predict_proba(X_va, num_iteration=model.best_iteration_)[:, 1]
+        oof_lgb[va_idx] = proba_va_lgb
 
         # Fold test proba 누적 (앙상블용)
-        proba_te = model.predict_proba(test_fold, num_iteration=model.best_iteration_)[:, 1]
-        test_proba_sum += proba_te
+        proba_te_lgb = model.predict_proba(test_fold, num_iteration=model.best_iteration_)[:, 1]
+        test_sum_lgb += proba_te_lgb
 
         # Feature importance 누적 (name 기반)
         try:
@@ -1459,16 +1510,16 @@ def cv_train_foldfit(
             pass
 
         # Metrics
-        auc = roc_auc_score(y_va, proba_va)
+        auc_lgb = float(roc_auc_score(y_va, proba_va_lgb))
 
         fixed_thr = float(cfg.train.threshold)
-        f1_fixed = float(f1_score(y_va, (proba_va >= fixed_thr).astype(int)))
+        f1_fixed_lgb = float(f1_score(y_va, (proba_va_lgb >= fixed_thr).astype(int)))
 
         # CV 로그를 "best threshold 기준 F1"로 통일
         if bool(cfg.train.optimize_threshold.enable):
             best_thr, f1_best = search_best_threshold(
                 y_true=y_va.values,
-                proba=proba_va,
+                proba=proba_va_lgb,
                 method=str(_select(cfg, "train.optimize_threshold.method", "pr_curve")),
                 min_t=float(cfg.train.optimize_threshold.clamp_min),
                 max_t=float(cfg.train.optimize_threshold.clamp_max),
@@ -1480,29 +1531,29 @@ def cv_train_foldfit(
                                        _select(cfg, "train.optimize_threshold.grid_step", 0.01))),
             )
             best_thr = float(best_thr)
-            f1 = float(f1_best)
+            f1_lgb = float(f1_best)
         else:
             # optimize_threshold 비활성화면 고정 threshold를 best로 취급
             best_thr = float(fixed_thr)
-            f1 = float(f1_fixed)
+            f1_lgb = float(f1_fixed_lgb)
 
-        aucs.append(float(auc))
-        f1s.append(float(f1))
+        aucs_lgb.append(auc_lgb)
+        f1s_lgb.append(f1_lgb)
         best_iters.append(int(model.best_iteration_))
 
         print(
-            f"[Fold {fold}] best_iter={model.best_iteration_} | AUC={auc:.5f} | "
-            f"F1_best@{best_thr:.3f}={f1:.5f} | F1_fixed@{fixed_thr:.3f}={f1_fixed:.5f}"
+            f"[Fold {fold}][LGB] best_iter={model.best_iteration_} | AUC={auc_lgb:.5f} | "
+            f"F1_best@{best_thr:.3f}={f1_lgb:.5f} | F1_fixed@{fixed_thr:.3f}={f1_fixed_lgb:.5f}"
         )
         wandb_log(
             run,
             {
                 "fold": fold,
-                "cv/auc": float(auc),
-                "cv/f1": float(f1),                    # best-threshold F1
-                "cv/best_threshold": float(best_thr),  # best threshold
-                "cv/f1_fixed": float(f1_fixed),        # 참고용(원하면 나중에 제거)
-                "cv/threshold_fixed": float(fixed_thr),
+                "cv/lgb/auc": float(auc_lgb),
+                "cv/lgb/f1": float(f1_lgb),
+                "cv/lgb/best_threshold": float(best_thr),
+                "cv/lgb/f1_fixed": float(f1_fixed_lgb),
+                "cv/lgb/threshold_fixed": float(fixed_thr),
                 "cv/best_iter": int(model.best_iteration_),
             },
             step=fold,
@@ -1517,8 +1568,216 @@ def cv_train_foldfit(
             model.booster_.save_model(str(fold_path))
             fold_model_paths.append(fold_path)
 
+        # -------------------
+        # 2) CatBoost (optional)
+        # -------------------
+        if cb_enable:
+            cb_params = dict(_select(cfg, "train.catboost.params", {}) or {})
+
+            # Hygiene defaults (safe under Hydra/wandb)
+            cb_params.setdefault("loss_function", "Logloss")
+            cb_params.setdefault("eval_metric", "AUC")
+            cb_params.setdefault("random_seed", int(cfg.train.seed))
+            cb_params.setdefault("allow_writing_files", False)
+            cb_params.setdefault("verbose", int(_select(cfg, "train.catboost.verbose", int(cfg.train.log_period))))
+
+            # Early stopping (od_wait)
+            cb_es = int(_select(cfg, "train.catboost.early_stopping_rounds", int(cfg.train.early_stopping_rounds)))
+            cb_params.setdefault("od_type", "Iter")
+            cb_params.setdefault("od_wait", cb_es)
+            cb_params.setdefault("use_best_model", True)
+
+            # cat feature indices
+            cat_idx = []
+            try:
+                if cat_cols:
+                    cat_idx = [int(X_tr.columns.get_loc(c)) for c in cat_cols if c in X_tr.columns] # type: ignore
+            except Exception:
+                cat_idx = []
+
+            cb_model = CatBoostClassifier(**cb_params)  # type: ignore
+            cb_model.fit(
+                X_tr, y_tr,
+                eval_set=(X_va, y_va),
+                cat_features=cat_idx if len(cat_idx) > 0 else None,
+            )
+
+            proba_va_cb = cb_model.predict_proba(X_va)[:, 1]
+            oof_cb[va_idx] = proba_va_cb  # type: ignore
+
+            proba_te_cb = cb_model.predict_proba(test_fold)[:, 1]
+            test_sum_cb += proba_te_cb  # type: ignore
+
+            auc_cb = float(roc_auc_score(y_va, proba_va_cb))
+            f1_fixed_cb = float(f1_score(y_va, (proba_va_cb >= fixed_thr).astype(int)))
+
+            if bool(cfg.train.optimize_threshold.enable):
+                cb_best_thr, cb_f1_best = search_best_threshold(
+                    y_true=y_va.values,
+                    proba=proba_va_cb,
+                    method=str(_select(cfg, "train.optimize_threshold.method", "pr_curve")),
+                    min_t=float(cfg.train.optimize_threshold.clamp_min),
+                    max_t=float(cfg.train.optimize_threshold.clamp_max),
+                    grid_start=float(_select(cfg, "train.optimize_threshold.grid.start",
+                                            _select(cfg, "train.optimize_threshold.grid_start", 0.05))),
+                    grid_end=float(_select(cfg, "train.optimize_threshold.grid.end",
+                                        _select(cfg, "train.optimize_threshold.grid_end", 0.95))),
+                    grid_step=float(_select(cfg, "train.optimize_threshold.grid.step",
+                                        _select(cfg, "train.optimize_threshold.grid_step", 0.01))),
+                )
+                cb_best_thr = float(cb_best_thr)
+                f1_cb = float(cb_f1_best)
+            else:
+                cb_best_thr = float(fixed_thr)
+                f1_cb = float(f1_fixed_cb)
+
+            aucs_cb.append(auc_cb)
+            f1s_cb.append(f1_cb)
+
+            print(
+                f"[Fold {fold}][CB ] AUC={auc_cb:.5f} | "
+                f"F1_best@{cb_best_thr:.3f}={f1_cb:.5f} | F1_fixed@{fixed_thr:.3f}={f1_fixed_cb:.5f}"
+            )
+            wandb_log(
+                run,
+                {
+                    "cv/cb/auc": float(auc_cb),
+                    "cv/cb/f1": float(f1_cb),
+                    "cv/cb/best_threshold": float(cb_best_thr),
+                    "cv/cb/f1_fixed": float(f1_fixed_cb),
+                    "cv/cb/threshold_fixed": float(fixed_thr),
+                },
+                step=fold,
+            )
+
+            # (옵션) fold CatBoost 모델 저장
+            if save_fold_models and fold_model_basepath is not None:
+                base = fold_model_basepath
+                cb_ext = str(_select(cfg, "train.catboost.model_ext", ".cbm"))
+                cb_fold_path = base.with_name(f"{base.stem}_cb_fold{fold}{cb_ext}")
+                cb_fold_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    cb_model.save_model(str(cb_fold_path))
+                    fold_model_paths.append(cb_fold_path)
+                except Exception as e:
+                    print(f"[Warn] saving CatBoost model failed (fold={fold}): {e}")
+
     n_splits = int(cfg.train.n_splits)
-    test_proba_mean = test_proba_sum / n_splits
+    test_lgb_mean = test_sum_lgb / n_splits
+
+    # Decide what to return: LGB-only vs Blended(LGB+CB)
+    if ens_enable and cb_enable and (oof_cb is not None) and (test_sum_cb is not None):
+        # ----- weight search on full OOF (maximize Binary F1) -----
+        w_min = float(_select(cfg, "train.ensemble.weight_search.min_w_lgb", 0.0))
+        w_max = float(_select(cfg, "train.ensemble.weight_search.max_w_lgb", 1.0))
+        w_step = float(_select(cfg, "train.ensemble.weight_search.step", 0.01))
+        w_default = float(_select(cfg, "train.ensemble.weight_search.default_w_lgb", 0.5))
+
+        def _eval_f1_with_threshold(proba_mix: np.ndarray) -> Tuple[float, float]:
+            fixed_thr = float(cfg.train.threshold)
+            if bool(cfg.train.optimize_threshold.enable):
+                t_best, f1_best = search_best_threshold(
+                    y_true=y.values,
+                    proba=proba_mix,
+                    method=str(_select(cfg, "train.optimize_threshold.method", "pr_curve")),
+                    min_t=float(cfg.train.optimize_threshold.clamp_min),
+                    max_t=float(cfg.train.optimize_threshold.clamp_max),
+                    grid_start=float(_select(cfg, "train.optimize_threshold.grid.start",
+                                            _select(cfg, "train.optimize_threshold.grid_start", 0.05))),
+                    grid_end=float(_select(cfg, "train.optimize_threshold.grid.end",
+                                        _select(cfg, "train.optimize_threshold.grid_end", 0.95))),
+                    grid_step=float(_select(cfg, "train.optimize_threshold.grid.step",
+                                        _select(cfg, "train.optimize_threshold.grid_step", 0.01))),
+                )
+                return float(t_best), float(f1_best)
+            else:
+                f1_fixed = float(f1_score(y.values, (proba_mix >= fixed_thr).astype(int)))
+                return float(fixed_thr), float(f1_fixed)
+
+        best_w = w_default
+        best_thr = float(cfg.train.threshold)
+        best_f1 = -1.0
+
+        if weight_search_enable:
+            if w_step <= 0:
+                w_step = 0.01
+            if w_min > w_max:
+                w_min, w_max = w_max, w_min
+            grid = np.arange(w_min, w_max + 1e-12, w_step, dtype=float)
+            for w_lgb in grid:
+                proba_mix = (w_lgb * oof_lgb) + ((1.0 - w_lgb) * oof_cb)  # type: ignore
+                t, f1v = _eval_f1_with_threshold(proba_mix)
+                if f1v > best_f1:
+                    best_f1 = f1v
+                    best_w = float(w_lgb)
+                    best_thr = float(t)
+        else:
+            proba_mix = (best_w * oof_lgb) + ((1.0 - best_w) * oof_cb)  # type: ignore
+            best_thr, best_f1 = _eval_f1_with_threshold(proba_mix)
+
+        # final blended outputs
+        oof_proba = (best_w * oof_lgb) + ((1.0 - best_w) * oof_cb)  # type: ignore
+        test_cb_mean = (test_sum_cb / n_splits)  # type: ignore
+        test_proba_mean = (best_w * test_lgb_mean) + ((1.0 - best_w) * test_cb_mean)
+
+        # recompute fold metrics with the selected weight (so main() prints the blended CV summary)
+        aucs = []
+        f1s = []
+        for fold, va_idx in enumerate(fold_va_indices, start=1):
+            y_va = y.iloc[va_idx]
+            proba_va_mix = oof_proba[va_idx]
+            auc_mix = float(roc_auc_score(y_va, proba_va_mix))
+
+            fixed_thr = float(cfg.train.threshold)
+            f1_fixed = float(f1_score(y_va, (proba_va_mix >= fixed_thr).astype(int)))
+            if bool(cfg.train.optimize_threshold.enable):
+                t_fold, f1_fold = search_best_threshold(
+                    y_true=y_va.values,
+                    proba=proba_va_mix,
+                    method=str(_select(cfg, "train.optimize_threshold.method", "pr_curve")),
+                    min_t=float(cfg.train.optimize_threshold.clamp_min),
+                    max_t=float(cfg.train.optimize_threshold.clamp_max),
+                    grid_start=float(_select(cfg, "train.optimize_threshold.grid.start",
+                                            _select(cfg, "train.optimize_threshold.grid_start", 0.05))),
+                    grid_end=float(_select(cfg, "train.optimize_threshold.grid.end",
+                                        _select(cfg, "train.optimize_threshold.grid_end", 0.95))),
+                    grid_step=float(_select(cfg, "train.optimize_threshold.grid.step",
+                                        _select(cfg, "train.optimize_threshold.grid_step", 0.01))),
+                )
+                f1_mix = float(f1_fold)
+                t_mix = float(t_fold)
+            else:
+                f1_mix = float(f1_fixed)
+                t_mix = float(fixed_thr)
+            aucs.append(auc_mix)
+            f1s.append(f1_mix)
+
+            wandb_log(run, {
+                "cv/blend/auc": float(auc_mix),
+                "cv/blend/f1": float(f1_mix),
+                "cv/blend/best_threshold": float(t_mix),
+                "cv/blend/w_lgb": float(best_w),
+            }, step=fold)
+
+        # Log ensemble summary
+        wandb_log(run, {
+            "ensemble/enable": 1,
+            "ensemble/weight_search_enable": int(weight_search_enable),
+            "ensemble/best_w_lgb": float(best_w),
+            "ensemble/best_w_cb": float(1.0 - best_w),
+            "ensemble/oof_best_threshold": float(best_thr),
+            "ensemble/oof_best_f1": float(best_f1),
+            "ensemble/oof_auc": float(roc_auc_score(y.values, oof_proba)),
+            "cv/lgb/f1_mean": float(np.mean(f1s_lgb)) if f1s_lgb else None,
+            "cv/cb/f1_mean": float(np.mean(f1s_cb)) if f1s_cb else None,
+        })
+
+    else:
+        # LGB-only
+        oof_proba = oof_lgb
+        test_proba_mean = test_lgb_mean
+        aucs = aucs_lgb
+        f1s = f1s_lgb
 
     # feature importance를 reference column에 맞춰 정렬
     feat_imp_mean = np.array([feat_imp_sum.get(c, 0.0) / n_splits for c in feature_columns_ref], dtype=float)

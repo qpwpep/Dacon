@@ -12,13 +12,48 @@ threshold: 0.2
 # Optional: search best threshold on OOF to maximize F1
 optimize_threshold:
   enable: true
-  method: pr_curve   # pr_curve | grid
+  method: grid   # pr_curve | grid
   grid:
-    start: 0.05
-    end: 0.95
+    start: 0.10
+    end: 0.60
     step: 0.01
-  clamp_min: 0.05
-  clamp_max: 0.95
+  clamp_min: 0.10
+  clamp_max: 0.60
+
+# ---------------------------
+# CatBoost sub-model (optional)
+# ---------------------------
+catboost:
+  enable: true
+  # CatBoost early stopping (od_wait). If omitted -> train.early_stopping_rounds is used.
+  early_stopping_rounds: ${train.early_stopping_rounds}
+  # Saved fold model extension (when train.save_model && use_fold_ensemble)
+  model_ext: ".cbm"
+  # CatBoost params
+  params:
+    iterations: 5000
+    learning_rate: 0.05
+    depth: 8
+    l2_leaf_reg: 3.0
+    loss_function: "Logloss"
+    eval_metric: "AUC"
+    random_seed: ${train.seed}
+    allow_writing_files: false
+    task_type: "CPU"     # "GPU" 가능(환경에 맞게)
+    verbose: ${train.log_period}
+
+# ---------------------------
+# Ensemble (LGB + CatBoost)
+# ---------------------------
+ensemble:
+  enable: true
+  weight_search:
+    enable: true
+    # weight is for LGB. CatBoost weight = 1 - w_lgb
+    min_w_lgb: 0.0
+    max_w_lgb: 1.0
+    step: 0.01
+    default_w_lgb: 0.5
 
 # Outputs (saved inside Hydra run dir)
 out_path: submit_lgbm.csv
