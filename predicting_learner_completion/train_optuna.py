@@ -11,19 +11,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-import pandas as pd
+import numpy as np # type: ignore
+import pandas as pd # type: ignore
 
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score, f1_score, precision_recall_curve
-from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.model_selection import StratifiedKFold # type: ignore
+from sklearn.metrics import roc_auc_score, f1_score, precision_recall_curve # type: ignore
+from sklearn.preprocessing import MultiLabelBinarizer # type: ignore
 
-import lightgbm as lgb
+import lightgbm as lgb # type: ignore
+from catboost import CatBoostClassifier # type: ignore
 
-import hydra
-from hydra.utils import to_absolute_path
-from hydra.core.hydra_config import HydraConfig
-from omegaconf import DictConfig, OmegaConf
+import hydra # type: ignore
+from hydra.utils import to_absolute_path # type: ignore
+from hydra.core.hydra_config import HydraConfig # type: ignore
+from omegaconf import DictConfig, OmegaConf # type: ignore
 
 
 def seed_everything(seed: int) -> None:
@@ -261,8 +262,12 @@ def expand_multilabel_columns(
         # multi-hot matrix via MultiLabelBinarizer (small data, fine)
         if selected:
             mlb = MultiLabelBinarizer(classes=selected)
-            tr_bin = mlb.fit_transform(tr_lists.tolist())
-            te_bin = mlb.transform(te_lists.tolist())
+            # selected_set 밖 토큰 제거 → unknown class 경고 제거
+            tr_lists_sel = tr_lists.apply(lambda lst: [t for t in lst if t in selected_set])
+            te_lists_sel = te_lists.apply(lambda lst: [t for t in lst if t in selected_set])
+
+            tr_bin = mlb.fit_transform(tr_lists_sel.tolist())
+            te_bin = mlb.transform(te_lists_sel.tolist())
 
             tr_ohe = pd.DataFrame(tr_bin, index=train_df.index, columns=colnames).astype(np.int8)
             te_ohe = pd.DataFrame(te_bin, index=test_df.index, columns=colnames).astype(np.int8)
@@ -342,7 +347,7 @@ def apply_rare_bucket(
         tr = tr.where(tr.notna(), "__MISSING__").astype(str)
 
         vc = tr.value_counts(dropna=False)
-        rare_vals = vc[vc < int(min_freq)].index.astype(str).tolist()
+        rare_vals = vc[vc < int(min_freq)].index.astype(str).tolist() # type: ignore
         rare_vals = [v for v in rare_vals if v != "__MISSING__"]  # 결측 토큰은 유지
 
         if rare_vals:
@@ -367,9 +372,121 @@ def apply_rare_bucket(
 
     return train_df, test_df, info
 
+
+# "4-1" / "4/2" / "4학년 1학기" 같은 표기를 학기수로 환산(선택)
+_GRADE_TERM_RE = re.compile(r"^\s*(\d)\s*[-/]\s*([12])\s*$")
+_GRADE_TERM_KO_RE = re.compile(r"^\s*(\d)\s*학년\s*([12])\s*학기\s*$")
+
+def clean_completed_semester_series(
+    s: pd.Series,
+    min_val: int = 0,
+    max_val: int = 20,
+) -> tuple[pd.Series, pd.Series]:
+    """
+    completed_semester 정제:
+    - 정상 범위(min_val~max_val)의 '정수 학기수'만 남김
+    - 연도/학기 형태(예: 2020.02, 20241)나 비정상 값은 NaN 처리
+    - 대신 invalid flag 피처를 생성
+    """
+    raw = s.copy()
+    invalid = pd.Series(0, index=s.index, dtype="int8")
+
+    def _parse_one(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return np.nan, 0
+
+        # 숫자형 처리
+        if isinstance(v, (int, np.integer)):
+            x = float(v)
+        elif isinstance(v, (float, np.floating)):
+            x = float(v)
+        else:
+            ss = str(v).strip()
+            if ss == "":
+                return np.nan, 0
+
+            # "8학기" / "8 학기" -> 8
+            ss2 = re.sub(r"\s+", "", ss)
+            m = re.match(r"^(\d{1,2})학기$", ss2)
+            if m:
+                x = float(m.group(1))
+            else:
+                # "4-1" 같은 표기 -> (4-1)*2+1 = 7
+                m2 = _GRADE_TERM_RE.match(ss2)
+                if m2:
+                    g = int(m2.group(1))
+                    t = int(m2.group(2))
+                    # 학년이 1~6 정도인 경우만 유효 처리
+                    if 1 <= g <= 6 and t in (1, 2):
+                        x = float((g - 1) * 2 + t)
+                    else:
+                        return np.nan, 1
+                else:
+                    m3 = _GRADE_TERM_KO_RE.match(ss2)
+                    if m3:
+                        g = int(m3.group(1))
+                        t = int(m3.group(2))
+                        if 1 <= g <= 6 and t in (1, 2):
+                            x = float((g - 1) * 2 + t)
+                        else:
+                            return np.nan, 1
+                    else:
+                        # 일반 숫자 변환 시도 ("8", "8.0" 등)
+                        try:
+                            x = float(ss2)
+                        except Exception:
+                            return np.nan, 1
+
+        # 여기부터 “이상치 컷”
+        # 1000 이상은 대부분 연도/학기 입력으로 보고 NaN
+        if x >= 1000:
+            return np.nan, 1
+
+        # 정상 범위 밖이면 NaN(또는 clip로 바꿀 수도 있음)
+        if x < min_val or x > max_val:
+            return np.nan, 1
+
+        # 정수에 가까우면 반올림해서 int로
+        xr = int(round(x))
+        if abs(x - xr) > 1e-6:
+            # 8.3 같은 애매한 값은 NaN 처리
+            return np.nan, 1
+
+        return float(xr), 0
+
+    cleaned_vals = []
+    invalid_flags = []
+
+    for v in raw.tolist():
+        cv, iv = _parse_one(v)
+        cleaned_vals.append(cv)
+        invalid_flags.append(iv)
+
+    cleaned = pd.Series(cleaned_vals, index=s.index, dtype="float32")
+    invalid = pd.Series(invalid_flags, index=s.index, dtype="int8")
+
+    return cleaned, invalid
+
+
+
+
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """대회 컬럼 구성에 맞춘 최소 파생피처."""
     df = df.copy()
+
+    # completed_semester 정제 + invalid flag
+    if "completed_semester" in df.columns:
+        cleaned, invalid = clean_completed_semester_series(df["completed_semester"], min_val=0, max_val=20)
+        df["completed_semester"] = cleaned
+        df["completed_semester_invalid"] = invalid
+
+        # (선택) 버킷 피처: 너무 과하면 빼도 됨
+        # df["completed_semester_bucket"] = pd.cut(
+        #     df["completed_semester"],
+        #     bins=[-0.1, 2, 4, 6, 8, 10, 20],
+        #     labels=["0-2", "3-4", "5-6", "7-8", "9-10", "11+"],
+        # ).astype("object")
 
     # major_field 기반 파생피처 (존재할 때만)
     if "major_field" in df.columns:
@@ -398,7 +515,7 @@ def drop_constant_cols(
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     """train 기준 nunique<=1 인 상수 컬럼 드랍."""
     nunique = train_df.nunique(dropna=False)
-    const_cols = nunique[nunique <= 1].index.tolist()
+    const_cols = nunique[nunique <= 1].index.tolist() # type: ignore
     return train_df.drop(columns=const_cols), test_df.drop(columns=const_cols, errors="ignore"), const_cols
 
 
@@ -471,15 +588,228 @@ def make_categorical_safe(
 
     return train_df, test_df, cat_cols, categories_map
 
+def preprocess_fold_fit(
+    cfg: DictConfig,
+    X_tr: pd.DataFrame,
+    X_va: Optional[pd.DataFrame] = None,
+    test: Optional[pd.DataFrame] = None,
+    return_meta: bool = False,
+) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], Optional[pd.DataFrame], List[str], Dict[str, Any]]:
+    """Fold-fit 전처리 (leakage-free).
+
+    규칙:
+      - (fit) X_tr 만 사용해 분포 기반 전처리 기준을 생성
+          * multi-label vocab(top_k/min_freq)
+          * drop_missing/drop_constant 기준
+          * categorical_numeric 후보 결정
+          * rare bucket 기준
+          * category map
+      - (transform) X_va/test 는 위 기준으로 변환만 수행
+
+    반환:
+      X_tr_p, X_va_p, test_p, cat_cols_p, meta
+
+    meta는 return_meta=True일 때만 풍부하게 채웁니다(Optuna 등 반복 호출 성능 고려).
+    """
+
+    X_tr = X_tr.copy()
+    X_va = None if X_va is None else X_va.copy()
+    test = None if test is None else test.copy()
+
+    # ---- 0) val/test를 한 번에 변환하기 위한 other 구성 (index 충돌 방지)
+    parts = []
+    va_idx = None
+    te_idx = None
+
+    if X_va is not None:
+        va_idx = X_va.index
+        X_va.index = X_va.index.map(lambda i: f"va__{i}")
+        parts.append(X_va)
+    if test is not None:
+        te_idx = test.index
+        test.index = test.index.map(lambda i: f"te__{i}")
+        parts.append(test)
+
+    other = pd.concat(parts, axis=0) if parts else None
+
+    meta: Dict[str, Any] = {}
+
+    # ---- 1) Multi-label -> multi-hot (vocab은 X_tr에서만 생성)
+    multilabel_enabled = bool(_select(cfg, "data.multilabel.enable", False))
+    ml_cols = list(_select(cfg, "data.multilabel.cols", [])) or []
+    multilabel_info: Dict[str, Any] = {}
+
+    if multilabel_enabled and ml_cols:
+        top_k_val = _select(cfg, "data.multilabel.top_k", 50)
+        top_k_val = None if top_k_val is None else int(top_k_val)
+
+        if other is None:
+            X_tr, _, multilabel_info = expand_multilabel_columns(
+                train_df=X_tr,
+                test_df=X_tr.iloc[0:0].copy(), # type: ignore
+                cols=ml_cols,
+                sep=str(_select(cfg, "data.multilabel.sep", ",")),
+                min_freq=int(_select(cfg, "data.multilabel.min_freq", 3)),
+                top_k=top_k_val,
+                add_other=bool(_select(cfg, "data.multilabel.add_other", True)),
+                add_count=bool(_select(cfg, "data.multilabel.add_count", True)),
+                drop_original=bool(_select(cfg, "data.multilabel.drop_original", True)),
+            )
+        else:
+            X_tr, other, multilabel_info = expand_multilabel_columns(
+                train_df=X_tr,
+                test_df=other,
+                cols=ml_cols,
+                sep=str(_select(cfg, "data.multilabel.sep", ",")),
+                min_freq=int(_select(cfg, "data.multilabel.min_freq", 3)),
+                top_k=top_k_val,
+                add_other=bool(_select(cfg, "data.multilabel.add_other", True)),
+                add_count=bool(_select(cfg, "data.multilabel.add_count", True)),
+                drop_original=bool(_select(cfg, "data.multilabel.drop_original", True)),
+            )
+
+    # 멀티라벨 파생 컬럼 목록(나중에 categorical 후보에서 제외)
+    ml_generated_cols: List[str] = []
+    if multilabel_enabled and ml_cols:
+        prefixes = tuple(f"{c}__" for c in ml_cols)
+        ml_generated_cols = [c for c in X_tr.columns if c.startswith(prefixes)]
+
+    # ---- 2) 결측률/상수 컬럼 drop (fit은 X_tr 기준)
+    dropped_missing: List[str] = []
+    dropped_const: List[str] = []
+
+    if other is None:
+        X_tr, _, dropped_missing = drop_high_missing_cols(
+            X_tr, X_tr.iloc[0:0].copy(), threshold=float(cfg.data.drop_missing_threshold) # type: ignore
+        )
+    else:
+        X_tr, other, dropped_missing = drop_high_missing_cols(
+            X_tr, other, threshold=float(cfg.data.drop_missing_threshold)
+        )
+
+    if bool(cfg.data.drop_constant_cols):
+        if other is None:
+            X_tr, _, dropped_const = drop_constant_cols(X_tr, X_tr.iloc[0:0].copy()) # type: ignore
+        else:
+            X_tr, other, dropped_const = drop_constant_cols(X_tr, other)
+
+    # ---- 3) categorical cols 결정 (fit은 X_tr 기준)
+    cat_cols = X_tr.select_dtypes(include=["object"]).columns.tolist()
+
+    if bool(cfg.data.categorical_numeric.enable):
+        exclude = list(cfg.data.categorical_numeric.exclude)
+
+        # (옵션) 멀티라벨 파생 컬럼 제외
+        if bool(_select(cfg, "data.multilabel.exclude_generated_from_categorical_numeric", True)):
+            exclude = exclude + ml_generated_cols
+
+        extra = infer_numeric_categorical_cols(
+            train_df=X_tr,
+            max_unique=int(cfg.data.categorical_numeric.max_unique),
+            include_bool=bool(cfg.data.categorical_numeric.include_bool),
+            exclude=exclude,
+            skip_binary_numeric=bool(_select(cfg, "data.categorical_numeric.skip_binary_numeric", True)),
+        )
+        cat_cols = sorted(set(cat_cols).union(set(extra)))
+
+    # (안전장치) 멀티라벨 파생이 cat_cols에 들어갔으면 제거
+    if ml_generated_cols and bool(_select(cfg, "data.multilabel.exclude_generated_from_categorical_cols", True)):
+        cat_cols = [c for c in cat_cols if c not in set(ml_generated_cols)]
+
+    # ---- 4) Rare bucket (fit은 X_tr value_counts)
+    rare_enabled = bool(_select(cfg, "data.rare_bucket.enable", False))
+    rare_info: Dict[str, Dict[str, Any]] = {}
+
+    if rare_enabled:
+        min_freq = int(_select(cfg, "data.rare_bucket.min_freq", 3))
+        exclude_cols = list(_select(cfg, "data.rare_bucket.exclude", [])) or []
+
+        if other is None:
+            X_tr, _, rare_info = apply_rare_bucket(
+                train_df=X_tr,
+                test_df=X_tr.iloc[0:0].copy(), # type: ignore
+                categorical_cols=cat_cols,
+                min_freq=min_freq,
+                exclude_cols=exclude_cols,
+            )
+        else:
+            X_tr, other, rare_info = apply_rare_bucket(
+                train_df=X_tr,
+                test_df=other,
+                categorical_cols=cat_cols,
+                min_freq=min_freq,
+                exclude_cols=exclude_cols,
+            )
+
+    # ---- 5) category map (fit은 X_tr categories)
+    categories_map: Dict[str, List[str]] = {}
+    if other is None:
+        X_tr, _, cat_cols, categories_map = make_categorical_safe(
+            X_tr, X_tr.iloc[0:0].copy(), categorical_cols=cat_cols # type: ignore
+        )
+    else:
+        X_tr, other, cat_cols, categories_map = make_categorical_safe(
+            X_tr, other, categorical_cols=cat_cols
+        )
+
+    # ---- 6) 컬럼 정렬/정합: other는 X_tr 컬럼을 따라가게 reindex
+    if other is not None:
+        other = other.reindex(columns=X_tr.columns, fill_value=np.nan)
+
+    # ---- 7) 원래 index로 복구하며 분리
+    X_va_p = None
+    test_p = None
+    if other is not None:
+        if va_idx is not None:
+            X_va_p = other.loc[[f"va__{i}" for i in va_idx]].copy()
+            X_va_p.index = va_idx
+        if te_idx is not None:
+            test_p = other.loc[[f"te__{i}" for i in te_idx]].copy()
+            test_p.index = te_idx
+
+    # ---- 8) meta (옵션)
+    if return_meta:
+        # Summarize category map (avoid huge artifact)
+        cat_summary: Dict[str, Dict[str, Any]] = {}
+        for col, cats in categories_map.items():
+            cats_list = list(cats)
+            cat_summary[col] = {
+                "n_categories": int(len(cats_list)),
+                "sample_categories": cats_list[:30],
+            }
+
+        meta = {
+            "dropped_missing_cols": list(dropped_missing),
+            "dropped_constant_cols": list(dropped_const),
+            "categorical_cols": list(cat_cols),
+            "rare_bucket": {
+                "enable": bool(rare_enabled),
+                "min_freq": int(_select(cfg, "data.rare_bucket.min_freq", 3)) if bool(rare_enabled) else None,
+                "n_affected_cols": int(sum(1 for _c, _v in rare_info.items() if int(_v.get("n_rare", 0)) > 0)),
+                "per_col_n_rare": {str(_c): int(_v.get("n_rare", 0)) for _c, _v in rare_info.items()},
+            },
+            "multilabel": {
+                "enable": bool(multilabel_enabled and bool(ml_cols)),
+                "cols": list(ml_cols) if bool(multilabel_enabled and bool(ml_cols)) else [],
+                "per_col": multilabel_info,
+            },
+            "n_features": int(X_tr.shape[1]),
+            "feature_columns": list(X_tr.columns),
+            "categories_map_summary": cat_summary,
+        }
+
+    return X_tr, X_va_p, test_p, cat_cols, meta # type: ignore
+
+
 
 def maybe_init_wandb(cfg: DictConfig):
     if not cfg.wandb.enable:
         return None
 
     try:
-        import wandb
+        import wandb # type: ignore
 
-        run = wandb.init(
+        run = wandb.init( # type: ignore
             project=cfg.wandb.project,
             entity=cfg.wandb.entity,
             mode=cfg.wandb.mode,
@@ -498,9 +828,9 @@ def maybe_init_wandb(cfg: DictConfig):
 def wandb_log(run, payload: Dict[str, Any], step: Optional[int] = None) -> None:
     if run is None:
         return
-    import wandb
+    import wandb # type: ignore
 
-    wandb.log(payload, step=step)
+    wandb.log(payload, step=step) # type: ignore
 
 
 
@@ -580,6 +910,14 @@ def collect_run_info(cfg: DictConfig, run) -> Dict[str, Any]:
         "run_id": str(getattr(run, "id", "")) if run is not None else "local",
     }
 
+    catboost_version = None
+    try:
+        if CatBoostClassifier is not None:
+            import catboost  # type: ignore
+            catboost_version = getattr(catboost, "__version__", None)
+    except Exception:
+        catboost_version = None
+
     info: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(),
         "seed": int(getattr(cfg.train, "seed", 0)),
@@ -591,6 +929,7 @@ def collect_run_info(cfg: DictConfig, run) -> Dict[str, Any]:
         },
         "platform": platform.platform(),
         "lightgbm_version": getattr(lgb, "__version__", None),
+        "catboost_version": catboost_version,
         "git": get_git_info(repo_dir),
     }
     return info
@@ -609,9 +948,9 @@ def make_repro_bundle_path(model_path: Path, cfg: DictConfig, run, kind: str, ts
 def wandb_log_artifact(run, path: Path, name: str, art_type: str) -> None:
     if run is None:
         return
-    import wandb
+    import wandb # type: ignore
 
-    art = wandb.Artifact(name=name, type=art_type)
+    art = wandb.Artifact(name=name, type=art_type) # type: ignore
     art.add_file(str(path))
     run.log_artifact(art)
 
@@ -652,31 +991,45 @@ def search_best_threshold(
     if method == "grid":
         start = float(max(min_t, grid_start))
         end = float(min(max_t, grid_end))
-        step = float(grid_step) if grid_step is not None else 0.01
-        if step <= 0:
-            step = 0.01
 
-        thresholds = np.arange(start, end + 1e-12, step, dtype=float)
-        if thresholds.size == 0:
+        # 1) coarse grid (더 큰 간격으로 전체 탐색)
+        coarse_step = max(float(grid_step), 0.02)  # 예: 최소 0.02
+        coarse_thr = np.arange(start, end + 1e-12, coarse_step, dtype=float)
+
+        if coarse_thr.size == 0:
             t = float(np.clip(0.5, min_t, max_t))
             return t, float(f1_score(y_true, (proba >= t).astype(int)))
 
         y_pos = (y_true == 1)
-
-        # (n_samples, n_thr) boolean matrix
-        preds = (proba[:, None] >= thresholds[None, :])
-
+        preds = (proba[:, None] >= coarse_thr[None, :])
         tp = np.sum(preds & y_pos[:, None], axis=0).astype(float)
         fp = np.sum(preds & (~y_pos)[:, None], axis=0).astype(float)
         fn = np.sum((~preds) & y_pos[:, None], axis=0).astype(float)
-
         prec = tp / (tp + fp + 1e-15)
         rec = tp / (tp + fn + 1e-15)
         f1s = 2.0 * prec * rec / (prec + rec + 1e-15)
 
         best_idx = int(np.nanargmax(f1s))
-        best_t = float(thresholds[best_idx])
-        best_f1 = float(f1s[best_idx])
+        best_t_coarse = float(coarse_thr[best_idx])
+
+        # 2) fine grid (coarse 최적점 주변만 촘촘히 재탐색)
+        fine_step = min(float(grid_step), 0.002)   # 예: 최대 0.002까지 촘촘히
+        win = 3 * coarse_step                      # 주변 탐색 폭
+        fine_start = float(max(start, best_t_coarse - win))
+        fine_end   = float(min(end,   best_t_coarse + win))
+        fine_thr = np.arange(fine_start, fine_end + 1e-12, fine_step, dtype=float)
+
+        preds2 = (proba[:, None] >= fine_thr[None, :])
+        tp2 = np.sum(preds2 & y_pos[:, None], axis=0).astype(float)
+        fp2 = np.sum(preds2 & (~y_pos)[:, None], axis=0).astype(float)
+        fn2 = np.sum((~preds2) & y_pos[:, None], axis=0).astype(float)
+        prec2 = tp2 / (tp2 + fp2 + 1e-15)
+        rec2 = tp2 / (tp2 + fn2 + 1e-15)
+        f1s2 = 2.0 * prec2 * rec2 / (prec2 + rec2 + 1e-15)
+
+        best_idx2 = int(np.nanargmax(f1s2))
+        best_t = float(fine_thr[best_idx2])
+        best_f1 = float(f1s2[best_idx2])
         return best_t, best_f1
 
     # ---------- pr_curve (default) ----------
@@ -717,35 +1070,26 @@ def _select(cfg, key: str, default=None):
 
 def run_optuna_tuning(
     cfg: DictConfig,
-    X: pd.DataFrame,
+    X_raw: pd.DataFrame,
     y: pd.Series,
-    cat_cols: List[str],
     run=None,
 ) -> Dict[str, Any]:
-    """Tune a few LightGBM hyperparameters with Optuna and return best overrides.
+    """Tune LightGBM hyperparameters with Optuna (fold-fit preprocessing, leakage-free).
 
-    Tuning params:
-      - learning_rate
-      - max_depth
-      - num_leaves
-      - min_child_samples
-      - min_split_gain
-      - reg_alpha / reg_lambda
-      - subsample / subsample_freq
-      - colsample_bytree
-      - max_bin
-      - scale_pos_weight
+    IMPORTANT:
+      - 각 fold의 전처리 기준(rare bucket/vocab/category map 등)은 train-fold에서만 생성합니다.
+      - 검증 fold는 해당 기준으로 transform만 수행합니다.
 
     Metric:
       - "auc" (default) : mean AUC over folds
-      - "f1"            : OOF F1 at best threshold (grid-search threshold on OOF)
+      - "f1"            : OOF F1 at best threshold (OOF 기반 threshold 탐색)
     """
     enable = bool(_select(cfg, "train.optuna.enable", False))
     if not enable:
         return {}
 
     try:
-        import optuna
+        import optuna # type: ignore
     except ImportError as e:
         raise ImportError("Optuna is not installed. Run: pip install optuna") from e
 
@@ -758,10 +1102,6 @@ def run_optuna_tuning(
     if metric not in ("auc", "f1"):
         raise ValueError(f"Unsupported optuna metric: {metric} (use 'auc' or 'f1')")
 
-    # What to use for pruning intermediate values:
-    # - "auc": report mean AUC over completed folds (stable)
-    # - "f1" : report partial OOF F1 (threshold-optimized) over completed folds
-    # - "auto": use "auc" when tuning metric is f1, otherwise use metric
     prune_metric = str(getattr(optuna_cfg, "prune_metric", "auc")).lower()
     if prune_metric == "auto":
         prune_metric = "auc" if metric == "f1" else metric
@@ -781,9 +1121,6 @@ def run_optuna_tuning(
     pruner_cfg = getattr(optuna_cfg, "pruner", None)
     pruner_name = str(getattr(pruner_cfg, "name", "median")).lower() if pruner_cfg is not None else "median"
     n_warmup_steps = int(getattr(pruner_cfg, "n_warmup_steps", 10)) if pruner_cfg is not None else 10
-
-    # IMPORTANT: if warmup steps > number of folds, pruning never triggers.
-    # Cap warmup to n_splits so pruner can actually work.
     if n_warmup_steps > n_splits:
         n_warmup_steps = n_splits
 
@@ -792,16 +1129,14 @@ def run_optuna_tuning(
     elif pruner_name == "hyperband":
         pruner = optuna.pruners.HyperbandPruner()
     else:
-        # default: median pruner
         pruner = optuna.pruners.MedianPruner(n_warmup_steps=n_warmup_steps)
 
     study_name = str(getattr(optuna_cfg, "study_name", "lgbm_tuning"))
     storage = getattr(optuna_cfg, "storage", None)  # e.g. "sqlite:///optuna.db"
-    direction = "maximize"
 
     study = optuna.create_study(
         study_name=study_name,
-        direction=direction,
+        direction="maximize",
         sampler=sampler,
         pruner=pruner,
         storage=storage,
@@ -809,13 +1144,25 @@ def run_optuna_tuning(
     )
 
     base_params = dict(OmegaConf.to_container(cfg.model, resolve=True))
-
-    # Always keep deterministic behavior per trial (except for bagging)
     base_params["random_state"] = seed
+
+    # ---------------------------
+    # (옵션) Fold별 전처리 캐시: 전처리는 trial과 무관하므로 1회만 수행해 속도를 올릴 수 있음
+    # ---------------------------
+    cache_preprocess = bool(_select(cfg, "train.optuna.preprocess_cache", True))
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    fold_splits = list(skf.split(X_raw, y))
+
+    fold_cache: List[Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, List[str]]] = []
+    if cache_preprocess:
+        for tr_idx, va_idx in fold_splits:
+            X_tr_raw, y_tr = X_raw.iloc[tr_idx], y.iloc[tr_idx]
+            X_va_raw, y_va = X_raw.iloc[va_idx], y.iloc[va_idx]
+            X_tr, X_va, _, cat_cols, _ = preprocess_fold_fit(cfg, X_tr_raw, X_va_raw, None, return_meta=False)
+            fold_cache.append((X_tr, y_tr, X_va, y_va, cat_cols)) # type: ignore
 
     def objective(trial: "optuna.Trial") -> float:
         params = dict(base_params)
-
 
         # Search spaces (from YAML if provided; otherwise fall back to safe defaults)
         ss = getattr(optuna_cfg, "search_space", None)
@@ -839,10 +1186,6 @@ def run_optuna_tuning(
             return float(trial.suggest_float(name, _low, _high, log=_log))
 
         def _ss_float_alias(primary: str, alias: str, low: float, high: float, log: bool = False) -> float:
-            """
-            YAML 키 alias를 primary로 매핑해서 trial 파라미터 이름은 primary로 통일.
-            예) feature_fraction(=alias) -> colsample_bytree(=primary)
-            """
             if ss is not None and (not hasattr(ss, primary)) and hasattr(ss, alias):
                 cfg_item = getattr(ss, alias)
                 _low = float(getattr(cfg_item, "low", low))
@@ -852,7 +1195,6 @@ def run_optuna_tuning(
             return _ss_float(primary, low, high, log=log)
 
         def _ss_cat(name: str, choices: List[Any]) -> Any:
-            """Categorical search space with optional YAML override: {choices: [...]}"""
             if ss is None or not hasattr(ss, name):
                 return trial.suggest_categorical(name, choices)
             cfg_item = getattr(ss, name)
@@ -870,49 +1212,45 @@ def run_optuna_tuning(
         reg_lambda = _ss_float("reg_lambda", 1e-3, 500.0, log=True)
         subsample = _ss_float("subsample", 0.6, 1.0, log=False)
         subsample_freq = _ss_cat("subsample_freq", [0, 1, 2, 5])
-        # (하위호환) feature_fraction 키가 오면 colsample_bytree로 매핑
         colsample_bytree = _ss_float_alias("colsample_bytree", "feature_fraction", 0.4, 1.0, log=False)
         max_bin = _ss_cat("max_bin", [127, 255, 511])
         scale_pos_weight = _ss_float("scale_pos_weight", 1.0, 4.0, log=True)
 
-        # mild constraint: if max_depth is limited, cap num_leaves to 2^max_depth
         if int(max_depth) > 0:
             max_leaves = int(2 ** int(max_depth))
             num_leaves = int(min(int(num_leaves), max_leaves))
 
-        # bagging only makes sense when subsample < 1.0
         if float(subsample) >= 0.999:
             subsample_freq = 0
         else:
             subsample_freq = int(max(1, int(subsample_freq)))
 
-        params["learning_rate"] = float(learning_rate)
-        params["max_depth"] = int(max_depth)
-        params["num_leaves"] = int(num_leaves)
-        params["min_child_samples"] = int(min_child_samples)
-        params["min_split_gain"] = float(min_split_gain)
-        params["reg_alpha"] = float(reg_alpha)
-        params["reg_lambda"] = float(reg_lambda)
-        params["subsample"] = float(subsample)
-        params["subsample_freq"] = int(subsample_freq)
-        # sklearn wrapper uses colsample_bytree; map "feature_fraction" -> "colsample_bytree"
-        params["colsample_bytree"] = float(colsample_bytree)
-        params["max_bin"] = int(max_bin)
-        params["scale_pos_weight"] = float(scale_pos_weight)
-
-        skf = StratifiedKFold(
-            n_splits=n_splits,
-            shuffle=True,
-            random_state=seed,
-        )
+        params.update({
+            "learning_rate": float(learning_rate),
+            "max_depth": int(max_depth),
+            "num_leaves": int(num_leaves),
+            "min_child_samples": int(min_child_samples),
+            "min_split_gain": float(min_split_gain),
+            "reg_alpha": float(reg_alpha),
+            "reg_lambda": float(reg_lambda),
+            "subsample": float(subsample),
+            "subsample_freq": int(subsample_freq),
+            "colsample_bytree": float(colsample_bytree),
+            "max_bin": int(max_bin),
+            "scale_pos_weight": float(scale_pos_weight),
+        })
 
         aucs: List[float] = []
-        oof = np.zeros(len(X), dtype=float)
+        oof = np.zeros(len(X_raw), dtype=float)
         seen_idx: List[int] = []
 
-        for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y), start=1):
-            X_tr, y_tr = X.iloc[tr_idx], y.iloc[tr_idx]
-            X_va, y_va = X.iloc[va_idx], y.iloc[va_idx]
+        for fold, (tr_idx, va_idx) in enumerate(fold_splits, start=1):
+            if cache_preprocess:
+                X_tr, y_tr, X_va, y_va, cat_cols = fold_cache[fold - 1]
+            else:
+                X_tr_raw, y_tr = X_raw.iloc[tr_idx], y.iloc[tr_idx]
+                X_va_raw, y_va = X_raw.iloc[va_idx], y.iloc[va_idx]
+                X_tr, X_va, _, cat_cols, _ = preprocess_fold_fit(cfg, X_tr_raw, X_va_raw, None, return_meta=False)
 
             model = lgb.LGBMClassifier(**params)
             model.fit(
@@ -928,6 +1266,7 @@ def run_optuna_tuning(
             proba_va = model.predict_proba(X_va, num_iteration=model.best_iteration_)[:, 1]
             oof[va_idx] = proba_va
             seen_idx.extend(list(va_idx))
+
             auc = roc_auc_score(y_va, proba_va)
             aucs.append(float(auc))
 
@@ -935,12 +1274,11 @@ def run_optuna_tuning(
             if prune_metric == "auc":
                 intermediate = float(np.mean(aucs))
             else:
-                # prune_metric == "f1": partial OOF F1 over completed folds only
                 try:
                     y_part = y.values[seen_idx]
                     p_part = oof[seen_idx]
                     if bool(cfg.train.optimize_threshold.enable):
-                        t_part, f1_part = search_best_threshold(
+                        _, f1_part = search_best_threshold(
                             y_true=y_part,
                             proba=p_part,
                             method=str(_select(cfg, "train.optimize_threshold.method", "pr_curve")),
@@ -962,11 +1300,9 @@ def run_optuna_tuning(
                 raise optuna.TrialPruned()
 
         auc_mean = float(np.mean(aucs))
-
         if metric == "auc":
             return auc_mean
 
-        # metric == "f1": tune threshold on OOF proba each trial
         if bool(cfg.train.optimize_threshold.enable):
             t, f1_best = search_best_threshold(
                 y_true=y.values,
@@ -981,18 +1317,16 @@ def run_optuna_tuning(
             trial.set_user_attr("best_threshold", float(t))
             return float(f1_best)
 
-        # fallback: use fixed threshold
         thr = float(cfg.train.threshold)
         trial.set_user_attr("best_threshold", float(thr))
         return float(f1_score(y.values, (oof >= thr).astype(int)))
 
-    print(f"\n[Optuna] Start tuning: n_trials={n_trials} | metric={metric} | folds={n_splits}")
+    print(f"\n[Optuna] Start tuning: n_trials={n_trials} | metric={metric} | folds={n_splits} | foldfit_preprocess=True")
     study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=True)
 
     best = study.best_trial
     best_params = dict(best.params)
 
-    # rename for config override usage
     overrides = {
         "learning_rate": float(best_params["learning_rate"]),
         "max_depth": int(best_params["max_depth"]),
@@ -1005,10 +1339,8 @@ def run_optuna_tuning(
         "subsample_freq": int(best_params["subsample_freq"]),
         "colsample_bytree": float(best_params["colsample_bytree"]),
         "max_bin": int(best_params["max_bin"]),
-        "scale_pos_weight": float(best_params["scale_pos_weight"]),
     }
 
-    # Persist best trial params into outputs/.../best_params.yaml
     best_threshold = None
     try:
         best_threshold = best.user_attrs.get("best_threshold", None)
@@ -1022,8 +1354,10 @@ def run_optuna_tuning(
             "best_value": float(best.value),
             "best_trial_number": int(best.number),
             "best_threshold": float(best_threshold) if best_threshold is not None else None,
-            "raw_params": dict(best.params),     # as suggested by Optuna
-            "model_overrides": dict(overrides),  # ready to merge into cfg.model
+            "raw_params": dict(best.params),
+            "model_overrides": dict(overrides),
+            "foldfit_preprocess": True,
+            "preprocess_cache": bool(cache_preprocess),
         }
     }
     saved_path = save_yaml_in_output_dir("best_params.yaml", best_payload)
@@ -1034,7 +1368,6 @@ def run_optuna_tuning(
     print("  params:", best.params)
 
     if run is not None:
-        # single log entry for best
         wandb_log(run, {
             "optuna/best_value": float(best.value),
             "optuna/best_learning_rate": overrides["learning_rate"],
@@ -1047,26 +1380,46 @@ def run_optuna_tuning(
             "optuna/best_subsample": overrides["subsample"],
             "optuna/best_subsample_freq": overrides["subsample_freq"],
             "optuna/best_colsample_bytree": overrides["colsample_bytree"],
-            "optuna/best_feature_fraction": overrides["colsample_bytree"],  # (옵션) 기존 대시보드 호환용
+            "optuna/best_feature_fraction": overrides["colsample_bytree"],
             "optuna/best_max_bin": overrides["max_bin"],
-            "optuna/best_scale_pos_weight": overrides["scale_pos_weight"],
+            "optuna/foldfit_preprocess": 1,
         })
 
     return overrides
 
 
 
-def cv_train(
+
+
+def cv_train_foldfit(
     cfg: DictConfig,
-    X: pd.DataFrame,
+    X_raw: pd.DataFrame,
     y: pd.Series,
-    test: pd.DataFrame,
-    cat_cols: List[str],
+    test_raw: pd.DataFrame,
     run,
+    feature_columns_ref: List[str],
     save_fold_models: bool = False,
     fold_model_basepath: Optional[Path] = None,
 ) -> Tuple[np.ndarray, np.ndarray, List[int], List[float], List[float], List[Path], np.ndarray]:
+    """CV 학습 (fold-fit 전처리로 누수 제거).
+
+    feature_importance는 fold마다 feature space가 달라질 수 있으므로,
+    feature_columns_ref(보통 full-fit 전처리 기준 컬럼)에 맞춰 정렬한 배열을 반환합니다.
+    """
+
     params = dict(OmegaConf.to_container(cfg.model, resolve=True))
+
+    # --- CatBoost (submodel) + Ensemble weight search config ---
+    cb_enable = bool(_select(cfg, "train.catboost.enable", False))
+    ens_enable = bool(_select(cfg, "train.ensemble.enable", True)) if cb_enable else False
+    weight_search_enable = bool(_select(cfg, "train.ensemble.weight_search.enable", True)) if ens_enable else False
+
+    # If user enabled CatBoost but package isn't installed -> fail fast
+    if cb_enable and CatBoostClassifier is None:
+        raise ImportError(
+            "CatBoost is enabled (train.catboost.enable=true) but catboost is not installed. "
+            "Run: pip install catboost"
+        )
 
     skf = StratifiedKFold(
         n_splits=int(cfg.train.n_splits),
@@ -1074,54 +1427,137 @@ def cv_train(
         random_state=int(cfg.train.seed),
     )
 
-    oof_proba = np.zeros(len(X), dtype=float)
-    test_proba_sum = np.zeros(len(test), dtype=float)  # fold별 test proba 누적
-    feat_imp_sum = np.zeros(X.shape[1], dtype=float)   # fold별 feature importance 누적(평균용)
+    # Base(LGB) OOF/test proba
+    oof_lgb = np.zeros(len(X_raw), dtype=float)
+    test_sum_lgb = np.zeros(len(test_raw), dtype=float)
+
+    # Sub(Cat) OOF/test proba (optional)
+    oof_cb = np.zeros(len(X_raw), dtype=float) if cb_enable else None
+    test_sum_cb = np.zeros(len(test_raw), dtype=float) if cb_enable else None
+
+    # feature importance: name 기반 누적
+    feat_imp_sum: Dict[str, float] = {}
 
     best_iters: List[int] = []
+    # We'll compute fold metrics for returned model:
+    # - if ensemble enabled -> blended metrics (computed after best weight is found)
+    # - else -> LGB metrics
+    aucs_lgb: List[float] = []
+    f1s_lgb: List[float] = []
+    aucs_cb: List[float] = []
+    f1s_cb: List[float] = []
+    fold_va_indices: List[np.ndarray] = []  # for recomputing blended fold metrics after weight search
+
     aucs: List[float] = []
     f1s: List[float] = []
     fold_model_paths: List[Path] = []
 
-    print("\n[CV] Start")
-    for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y), start=1):
-        X_tr, y_tr = X.iloc[tr_idx], y.iloc[tr_idx]
-        X_va, y_va = X.iloc[va_idx], y.iloc[va_idx]
+    print("\n[CV] Start (fold-fit preprocessing: leakage-free)")
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_raw, y), start=1):
+        X_tr_raw, y_tr = X_raw.iloc[tr_idx], y.iloc[tr_idx]
+        X_va_raw, y_va = X_raw.iloc[va_idx], y.iloc[va_idx]
+        fold_va_indices.append(np.asarray(va_idx))
 
+        # fold-fit 전처리 (rare/vocab/category map은 train-fold에서만 생성)
+        X_tr, X_va, test_fold, cat_cols, fold_meta = preprocess_fold_fit(
+            cfg,
+            X_tr_raw,
+            X_va_raw,
+            test_raw,
+            return_meta=bool(save_fold_models),
+        )
+
+        # (옵션) fold별 전처리 meta 저장 (fold ensemble 재현성에 도움)
+        if save_fold_models:
+            try:
+                fold_meta_payload = {"fold": int(fold), "preprocess": fold_meta}
+                save_yaml_in_output_dir(f"fold{fold}_preprocess_meta.yaml", fold_meta_payload)
+            except Exception as e:
+                print(f"[Warn] saving fold preprocess meta failed (fold={fold}): {e}")
+
+        # -------------------
+        # 1) LightGBM
+        # -------------------
         model = lgb.LGBMClassifier(**params)
         model.fit(
             X_tr, y_tr,
             eval_set=[(X_va, y_va)],
-            eval_metric="average_precision",
+            eval_metric="binary_logloss",  # or ["binary_logloss", "auc"]
             callbacks=[
-                lgb.early_stopping(stopping_rounds=int(cfg.train.early_stopping_rounds), verbose=False),
+                lgb.early_stopping(
+                    stopping_rounds=int(cfg.train.early_stopping_rounds),
+                    verbose=False,
+                    first_metric_only=True,), # early stopping은 첫 metric(logloss)로만
                 lgb.log_evaluation(period=int(cfg.train.log_period)),
             ],
             categorical_feature=cat_cols if len(cat_cols) > 0 else "auto",
         )
 
-        # OOF
-        proba_va = model.predict_proba(X_va, num_iteration=model.best_iteration_)[:, 1]
-        oof_proba[va_idx] = proba_va
+        proba_va_lgb = model.predict_proba(X_va, num_iteration=model.best_iteration_)[:, 1]
+        oof_lgb[va_idx] = proba_va_lgb
 
         # Fold test proba 누적 (앙상블용)
-        proba_te = model.predict_proba(test, num_iteration=model.best_iteration_)[:, 1]
-        test_proba_sum += proba_te
+        proba_te_lgb = model.predict_proba(test_fold, num_iteration=model.best_iteration_)[:, 1]
+        test_sum_lgb += proba_te_lgb
 
-        # Feature importance 누적(평균)
-        feat_imp_sum += model.feature_importances_
+        # Feature importance 누적 (name 기반)
+        try:
+            names = list(X_tr.columns)
+            imps = model.feature_importances_
+            for n, v in zip(names, imps):
+                feat_imp_sum[n] = float(feat_imp_sum.get(n, 0.0) + float(v))
+        except Exception:
+            pass
 
         # Metrics
-        auc = roc_auc_score(y_va, proba_va)
-        pred_va = (proba_va >= float(cfg.train.threshold)).astype(int)
-        f1 = f1_score(y_va, pred_va)
+        auc_lgb = float(roc_auc_score(y_va, proba_va_lgb))
 
-        aucs.append(float(auc))
-        f1s.append(float(f1))
+        fixed_thr = float(cfg.train.threshold)
+        f1_fixed_lgb = float(f1_score(y_va, (proba_va_lgb >= fixed_thr).astype(int)))
+
+        # CV 로그를 "best threshold 기준 F1"로 통일
+        if bool(cfg.train.optimize_threshold.enable):
+            best_thr, f1_best = search_best_threshold(
+                y_true=y_va.values,
+                proba=proba_va_lgb,
+                method=str(_select(cfg, "train.optimize_threshold.method", "pr_curve")),
+                min_t=float(cfg.train.optimize_threshold.clamp_min),
+                max_t=float(cfg.train.optimize_threshold.clamp_max),
+                grid_start=float(_select(cfg, "train.optimize_threshold.grid.start",
+                                        _select(cfg, "train.optimize_threshold.grid_start", 0.05))),
+                grid_end=float(_select(cfg, "train.optimize_threshold.grid.end",
+                                      _select(cfg, "train.optimize_threshold.grid_end", 0.95))),
+                grid_step=float(_select(cfg, "train.optimize_threshold.grid.step",
+                                       _select(cfg, "train.optimize_threshold.grid_step", 0.01))),
+            )
+            best_thr = float(best_thr)
+            f1_lgb = float(f1_best)
+        else:
+            # optimize_threshold 비활성화면 고정 threshold를 best로 취급
+            best_thr = float(fixed_thr)
+            f1_lgb = float(f1_fixed_lgb)
+
+        aucs_lgb.append(auc_lgb)
+        f1s_lgb.append(f1_lgb)
         best_iters.append(int(model.best_iteration_))
 
-        print(f"[Fold {fold}] best_iter={model.best_iteration_} | AUC={auc:.5f} | F1@{cfg.train.threshold}={f1:.5f}")
-        wandb_log(run, {"fold": fold, "cv/auc": auc, "cv/f1": f1, "cv/best_iter": model.best_iteration_}, step=fold)
+        print(
+            f"[Fold {fold}][LGB] best_iter={model.best_iteration_} | AUC={auc_lgb:.5f} | "
+            f"F1_best@{best_thr:.3f}={f1_lgb:.5f} | F1_fixed@{fixed_thr:.3f}={f1_fixed_lgb:.5f}"
+        )
+        wandb_log(
+            run,
+            {
+                "fold": fold,
+                "cv/lgb/auc": float(auc_lgb),
+                "cv/lgb/f1": float(f1_lgb),
+                "cv/lgb/best_threshold": float(best_thr),
+                "cv/lgb/f1_fixed": float(f1_fixed_lgb),
+                "cv/lgb/threshold_fixed": float(fixed_thr),
+                "cv/best_iter": int(model.best_iteration_),
+            },
+            step=fold,
+        )
 
         # (옵션) fold 모델 저장
         if save_fold_models and fold_model_basepath is not None:
@@ -1132,11 +1568,223 @@ def cv_train(
             model.booster_.save_model(str(fold_path))
             fold_model_paths.append(fold_path)
 
+        # -------------------
+        # 2) CatBoost (optional)
+        # -------------------
+        if cb_enable:
+            cb_params = dict(_select(cfg, "train.catboost.params", {}) or {})
+
+            # Hygiene defaults (safe under Hydra/wandb)
+            cb_params.setdefault("loss_function", "Logloss")
+            cb_params.setdefault("eval_metric", "AUC")
+            cb_params.setdefault("random_seed", int(cfg.train.seed))
+            cb_params.setdefault("allow_writing_files", False)
+            cb_params.setdefault("verbose", int(_select(cfg, "train.catboost.verbose", int(cfg.train.log_period))))
+
+            # Early stopping (od_wait)
+            cb_es = int(_select(cfg, "train.catboost.early_stopping_rounds", int(cfg.train.early_stopping_rounds)))
+            cb_params.setdefault("od_type", "Iter")
+            cb_params.setdefault("od_wait", cb_es)
+            cb_params.setdefault("use_best_model", True)
+
+            # cat feature indices
+            cat_idx = []
+            try:
+                if cat_cols:
+                    cat_idx = [int(X_tr.columns.get_loc(c)) for c in cat_cols if c in X_tr.columns] # type: ignore
+            except Exception:
+                cat_idx = []
+
+            cb_model = CatBoostClassifier(**cb_params)  # type: ignore
+            cb_model.fit(
+                X_tr, y_tr,
+                eval_set=(X_va, y_va),
+                cat_features=cat_idx if len(cat_idx) > 0 else None,
+            )
+
+            proba_va_cb = cb_model.predict_proba(X_va)[:, 1]
+            oof_cb[va_idx] = proba_va_cb  # type: ignore
+
+            proba_te_cb = cb_model.predict_proba(test_fold)[:, 1]
+            test_sum_cb += proba_te_cb  # type: ignore
+
+            auc_cb = float(roc_auc_score(y_va, proba_va_cb))
+            f1_fixed_cb = float(f1_score(y_va, (proba_va_cb >= fixed_thr).astype(int)))
+
+            if bool(cfg.train.optimize_threshold.enable):
+                cb_best_thr, cb_f1_best = search_best_threshold(
+                    y_true=y_va.values,
+                    proba=proba_va_cb,
+                    method=str(_select(cfg, "train.optimize_threshold.method", "pr_curve")),
+                    min_t=float(cfg.train.optimize_threshold.clamp_min),
+                    max_t=float(cfg.train.optimize_threshold.clamp_max),
+                    grid_start=float(_select(cfg, "train.optimize_threshold.grid.start",
+                                            _select(cfg, "train.optimize_threshold.grid_start", 0.05))),
+                    grid_end=float(_select(cfg, "train.optimize_threshold.grid.end",
+                                        _select(cfg, "train.optimize_threshold.grid_end", 0.95))),
+                    grid_step=float(_select(cfg, "train.optimize_threshold.grid.step",
+                                        _select(cfg, "train.optimize_threshold.grid_step", 0.01))),
+                )
+                cb_best_thr = float(cb_best_thr)
+                f1_cb = float(cb_f1_best)
+            else:
+                cb_best_thr = float(fixed_thr)
+                f1_cb = float(f1_fixed_cb)
+
+            aucs_cb.append(auc_cb)
+            f1s_cb.append(f1_cb)
+
+            print(
+                f"[Fold {fold}][CB ] AUC={auc_cb:.5f} | "
+                f"F1_best@{cb_best_thr:.3f}={f1_cb:.5f} | F1_fixed@{fixed_thr:.3f}={f1_fixed_cb:.5f}"
+            )
+            wandb_log(
+                run,
+                {
+                    "cv/cb/auc": float(auc_cb),
+                    "cv/cb/f1": float(f1_cb),
+                    "cv/cb/best_threshold": float(cb_best_thr),
+                    "cv/cb/f1_fixed": float(f1_fixed_cb),
+                    "cv/cb/threshold_fixed": float(fixed_thr),
+                },
+                step=fold,
+            )
+
+            # (옵션) fold CatBoost 모델 저장
+            if save_fold_models and fold_model_basepath is not None:
+                base = fold_model_basepath
+                cb_ext = str(_select(cfg, "train.catboost.model_ext", ".cbm"))
+                cb_fold_path = base.with_name(f"{base.stem}_cb_fold{fold}{cb_ext}")
+                cb_fold_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    cb_model.save_model(str(cb_fold_path))
+                    fold_model_paths.append(cb_fold_path)
+                except Exception as e:
+                    print(f"[Warn] saving CatBoost model failed (fold={fold}): {e}")
+
     n_splits = int(cfg.train.n_splits)
-    test_proba_mean = test_proba_sum / n_splits
-    feat_imp_mean = feat_imp_sum / n_splits
+    test_lgb_mean = test_sum_lgb / n_splits
+
+    # Decide what to return: LGB-only vs Blended(LGB+CB)
+    if ens_enable and cb_enable and (oof_cb is not None) and (test_sum_cb is not None):
+        # ----- weight search on full OOF (maximize Binary F1) -----
+        w_min = float(_select(cfg, "train.ensemble.weight_search.min_w_lgb", 0.0))
+        w_max = float(_select(cfg, "train.ensemble.weight_search.max_w_lgb", 1.0))
+        w_step = float(_select(cfg, "train.ensemble.weight_search.step", 0.01))
+        w_default = float(_select(cfg, "train.ensemble.weight_search.default_w_lgb", 0.5))
+
+        def _eval_f1_with_threshold(proba_mix: np.ndarray) -> Tuple[float, float]:
+            fixed_thr = float(cfg.train.threshold)
+            if bool(cfg.train.optimize_threshold.enable):
+                t_best, f1_best = search_best_threshold(
+                    y_true=y.values,
+                    proba=proba_mix,
+                    method=str(_select(cfg, "train.optimize_threshold.method", "pr_curve")),
+                    min_t=float(cfg.train.optimize_threshold.clamp_min),
+                    max_t=float(cfg.train.optimize_threshold.clamp_max),
+                    grid_start=float(_select(cfg, "train.optimize_threshold.grid.start",
+                                            _select(cfg, "train.optimize_threshold.grid_start", 0.05))),
+                    grid_end=float(_select(cfg, "train.optimize_threshold.grid.end",
+                                        _select(cfg, "train.optimize_threshold.grid_end", 0.95))),
+                    grid_step=float(_select(cfg, "train.optimize_threshold.grid.step",
+                                        _select(cfg, "train.optimize_threshold.grid_step", 0.01))),
+                )
+                return float(t_best), float(f1_best)
+            else:
+                f1_fixed = float(f1_score(y.values, (proba_mix >= fixed_thr).astype(int)))
+                return float(fixed_thr), float(f1_fixed)
+
+        best_w = w_default
+        best_thr = float(cfg.train.threshold)
+        best_f1 = -1.0
+
+        if weight_search_enable:
+            if w_step <= 0:
+                w_step = 0.01
+            if w_min > w_max:
+                w_min, w_max = w_max, w_min
+            grid = np.arange(w_min, w_max + 1e-12, w_step, dtype=float)
+            for w_lgb in grid:
+                proba_mix = (w_lgb * oof_lgb) + ((1.0 - w_lgb) * oof_cb)  # type: ignore
+                t, f1v = _eval_f1_with_threshold(proba_mix)
+                if f1v > best_f1:
+                    best_f1 = f1v
+                    best_w = float(w_lgb)
+                    best_thr = float(t)
+        else:
+            proba_mix = (best_w * oof_lgb) + ((1.0 - best_w) * oof_cb)  # type: ignore
+            best_thr, best_f1 = _eval_f1_with_threshold(proba_mix)
+
+        # final blended outputs
+        oof_proba = (best_w * oof_lgb) + ((1.0 - best_w) * oof_cb)  # type: ignore
+        test_cb_mean = (test_sum_cb / n_splits)  # type: ignore
+        test_proba_mean = (best_w * test_lgb_mean) + ((1.0 - best_w) * test_cb_mean)
+
+        # recompute fold metrics with the selected weight (so main() prints the blended CV summary)
+        aucs = []
+        f1s = []
+        for fold, va_idx in enumerate(fold_va_indices, start=1):
+            y_va = y.iloc[va_idx]
+            proba_va_mix = oof_proba[va_idx]
+            auc_mix = float(roc_auc_score(y_va, proba_va_mix))
+
+            fixed_thr = float(cfg.train.threshold)
+            f1_fixed = float(f1_score(y_va, (proba_va_mix >= fixed_thr).astype(int)))
+            if bool(cfg.train.optimize_threshold.enable):
+                t_fold, f1_fold = search_best_threshold(
+                    y_true=y_va.values,
+                    proba=proba_va_mix,
+                    method=str(_select(cfg, "train.optimize_threshold.method", "pr_curve")),
+                    min_t=float(cfg.train.optimize_threshold.clamp_min),
+                    max_t=float(cfg.train.optimize_threshold.clamp_max),
+                    grid_start=float(_select(cfg, "train.optimize_threshold.grid.start",
+                                            _select(cfg, "train.optimize_threshold.grid_start", 0.05))),
+                    grid_end=float(_select(cfg, "train.optimize_threshold.grid.end",
+                                        _select(cfg, "train.optimize_threshold.grid_end", 0.95))),
+                    grid_step=float(_select(cfg, "train.optimize_threshold.grid.step",
+                                        _select(cfg, "train.optimize_threshold.grid_step", 0.01))),
+                )
+                f1_mix = float(f1_fold)
+                t_mix = float(t_fold)
+            else:
+                f1_mix = float(f1_fixed)
+                t_mix = float(fixed_thr)
+            aucs.append(auc_mix)
+            f1s.append(f1_mix)
+
+            wandb_log(run, {
+                "cv/blend/auc": float(auc_mix),
+                "cv/blend/f1": float(f1_mix),
+                "cv/blend/best_threshold": float(t_mix),
+                "cv/blend/w_lgb": float(best_w),
+            }, step=fold)
+
+        # Log ensemble summary
+        wandb_log(run, {
+            "ensemble/enable": 1,
+            "ensemble/weight_search_enable": int(weight_search_enable),
+            "ensemble/best_w_lgb": float(best_w),
+            "ensemble/best_w_cb": float(1.0 - best_w),
+            "ensemble/oof_best_threshold": float(best_thr),
+            "ensemble/oof_best_f1": float(best_f1),
+            "ensemble/oof_auc": float(roc_auc_score(y.values, oof_proba)),
+            "cv/lgb/f1_mean": float(np.mean(f1s_lgb)) if f1s_lgb else None,
+            "cv/cb/f1_mean": float(np.mean(f1s_cb)) if f1s_cb else None,
+        })
+
+    else:
+        # LGB-only
+        oof_proba = oof_lgb
+        test_proba_mean = test_lgb_mean
+        aucs = aucs_lgb
+        f1s = f1s_lgb
+
+    # feature importance를 reference column에 맞춰 정렬
+    feat_imp_mean = np.array([feat_imp_sum.get(c, 0.0) / n_splits for c in feature_columns_ref], dtype=float)
 
     return oof_proba, test_proba_mean, best_iters, aucs, f1s, fold_model_paths, feat_imp_mean
+
+
 
 
 
@@ -1212,6 +1860,14 @@ def main(cfg: DictConfig) -> None:
     X = build_features(X)
     test = build_features(test)
 
+    # (누수 방지) CV/Optuna는 raw feature에서 fold-fit 전처리를 수행
+    X_raw = X.copy()
+    test_raw = test.copy()
+
+    # (메타/단일모델용) full-data 기준 전처리(기존 로직 유지)
+    X_full = X.copy()
+    test_full = test.copy()
+
     # Multi-label columns -> multi-hot (optional, train-only vocab to avoid leakage)
     multilabel_enabled = bool(_select(cfg, "data.multilabel.enable", False))
     multilabel_info: Dict[str, Any] = {}
@@ -1220,9 +1876,9 @@ def main(cfg: DictConfig) -> None:
         if ml_cols:
             top_k_val = _select(cfg, "data.multilabel.top_k", 50)
             top_k_val = None if top_k_val is None else int(top_k_val)
-            X, test, multilabel_info = expand_multilabel_columns(
-                train_df=X,
-                test_df=test,
+            X_full, test_full, multilabel_info = expand_multilabel_columns(
+                train_df=X_full,
+                test_df=test_full,
                 cols=ml_cols,
                 sep=str(_select(cfg, "data.multilabel.sep", ",")),
                 min_freq=int(_select(cfg, "data.multilabel.min_freq", 3)),
@@ -1238,18 +1894,19 @@ def main(cfg: DictConfig) -> None:
     ml_generated_cols: List[str] = []
     if multilabel_enabled and ml_cols:
         prefixes = tuple(f"{c}__" for c in ml_cols)
-        ml_generated_cols = [c for c in X.columns if c.startswith(prefixes)]
+        ml_generated_cols = [c for c in X_full.columns if c.startswith(prefixes)]
 
     # 결측률 높은 컬럼 드랍(train 기준)
-    X, test, dropped_missing = drop_high_missing_cols(X, test, threshold=float(cfg.data.drop_missing_threshold))
+    X_full, test_full, dropped_missing = drop_high_missing_cols(X_full, test_full, threshold=float(cfg.data.drop_missing_threshold))
 
     # 상수 컬럼 드랍(train 기준)
     dropped_const: List[str] = []
     if bool(cfg.data.drop_constant_cols):
-        X, test, dropped_const = drop_constant_cols(X, test)
+        X_full, test_full, dropped_const = drop_constant_cols(X_full, test_full)
 
     # 어떤 컬럼을 category로 볼지 결정
-    cat_cols = X.select_dtypes(include=["object"]).columns.tolist()
+    cat_cols_full = X_full.select_dtypes(include=["object"]).columns.tolist()
+    cat_cols = list(cat_cols_full)
 
     if bool(cfg.data.categorical_numeric.enable):
         # 기본 exclude + (옵션) 멀티라벨 파생 컬럼 제외
@@ -1258,7 +1915,7 @@ def main(cfg: DictConfig) -> None:
             exclude = exclude + ml_generated_cols
 
         extra = infer_numeric_categorical_cols(
-            train_df=X,
+            train_df=X_full,
             max_unique=int(cfg.data.categorical_numeric.max_unique),
             include_bool=bool(cfg.data.categorical_numeric.include_bool),
             exclude=exclude,
@@ -1278,23 +1935,23 @@ def main(cfg: DictConfig) -> None:
     if rare_enabled:
         min_freq = int(_select(cfg, "data.rare_bucket.min_freq", 3))
         exclude_cols = list(_select(cfg, "data.rare_bucket.exclude", [])) or []
-        X, test, rare_info = apply_rare_bucket(
-            train_df=X,
-            test_df=test,
+        X_full, test_full, rare_info = apply_rare_bucket(
+            train_df=X_full,
+            test_df=test_full,
             categorical_cols=cat_cols,
             min_freq=min_freq,
             exclude_cols=exclude_cols,
         )
 
-    X, test, cat_cols, categories_map = make_categorical_safe(X, test, categorical_cols=cat_cols)
+    X_full, test_full, cat_cols, categories_map = make_categorical_safe(X_full, test_full, categorical_cols=cat_cols)
 
     # train/test 컬럼 정렬 및 누락 컬럼 처리
-    test = test.reindex(columns=X.columns, fill_value=np.nan)
+    test_full = test_full.reindex(columns=X_full.columns, fill_value=np.nan)
 
 
     # Save preprocessing meta for reproducibility (included in fold model bundle under meta/)
     try:
-        feature_columns = list(X.columns)
+        feature_columns = list(X_full.columns)
         save_json_in_output_dir("feature_columns.json", feature_columns)
 
         # Summarize category map (avoid huge artifact)
@@ -1322,27 +1979,27 @@ def main(cfg: DictConfig) -> None:
                 "cols": list(_select(cfg, "data.multilabel.cols", [])) if bool(multilabel_enabled) else [],
                 "per_col": multilabel_info,
             },
-            "n_features": int(X.shape[1]),
+            "n_features": int(X_full.shape[1]),
             "categories_map_summary": cat_summary,
         }
         save_yaml_in_output_dir("preprocess_meta.yaml", preprocess_payload)
     except Exception as e:
         print(f"[Warn] saving preprocess meta failed: {e}")
-
     # Dataset summary
-    print(f"[Info] Train rows={len(train)} | Test rows={len(test)} | Features={X.shape[1]}")
+    print(f"[Info] Train rows={len(train)} | Test rows={len(test_full)} | Features={X_full.shape[1]}")
+    print("[Info] CV/Optuna uses fold-fit preprocessing on raw features (leakage-free)")
     print(f"[Info] Pos rate={y.mean():.4f} ({int(y.sum())}/{len(y)})")
     print(f"[Info] Dropped missing>{cfg.data.drop_missing_threshold}: {len(dropped_missing)} cols -> {dropped_missing}")
     if dropped_const:
         print(f"[Info] Dropped constant cols: {len(dropped_const)} cols -> {dropped_const}")
-    print(f"[Info] Categorical cols: {len(cat_cols)}")
+    print(f"[Info] Categorical cols (full-fit): {len(cat_cols)}")
 
     if run is not None:
         # Put some key info into run summary
         run.summary["data/train_rows"] = int(len(train))
-        run.summary["data/test_rows"] = int(len(test))
+        run.summary["data/test_rows"] = int(len(test_full))
         run.summary["data/pos_rate"] = float(y.mean())
-        run.summary["data/n_features"] = int(X.shape[1])
+        run.summary["data/n_features"] = int(X_full.shape[1])
         run.summary["data/dropped_missing_cols"] = len(dropped_missing)
         run.summary["data/dropped_constant_cols"] = len(dropped_const)
         run.summary["data/n_categorical_cols"] = len(cat_cols)
@@ -1352,7 +2009,7 @@ def main(cfg: DictConfig) -> None:
 
 
     # Optuna tuning (optional): updates cfg.model with best params before the main CV
-    optuna_overrides = run_optuna_tuning(cfg, X, y, cat_cols, run)
+    optuna_overrides = run_optuna_tuning(cfg, X_raw, y, run)
     if optuna_overrides:
         for k, v in optuna_overrides.items():
             cfg.model[k] = v
@@ -1363,8 +2020,8 @@ def main(cfg: DictConfig) -> None:
     save_fold_models = bool(cfg.train.save_model) and use_fold_ensemble
     fold_model_basepath = Path(cfg.train.model_path) if save_fold_models else None
 
-    oof_proba, test_proba_cv, best_iters, aucs, f1s, fold_model_paths, cv_feat_imp = cv_train(
-        cfg, X, y, test, cat_cols, run,
+    oof_proba, test_proba_cv, best_iters, aucs, f1s, fold_model_paths, cv_feat_imp = cv_train_foldfit(
+        cfg, X_raw, y, test_raw, run, feature_columns_ref=list(X_full.columns),
         save_fold_models=save_fold_models,
         fold_model_basepath=fold_model_basepath,
     )
@@ -1375,7 +2032,7 @@ def main(cfg: DictConfig) -> None:
 
     print("\n[CV] Done")
     print(f"AUC mean={auc_mean:.5f} ± {auc_std:.5f}")
-    print(f"F1  mean={f1_mean:.5f} ± {f1_std:.5f}")
+    print(f"F1(best-threshold) mean={f1_mean:.5f} ± {f1_std:.5f}")
     print(f"Use n_estimators={best_iter_final} (median best_iteration) for final fit")
 
     # Optional: OOF-based threshold tuning
@@ -1414,7 +2071,7 @@ def main(cfg: DictConfig) -> None:
             "auc_mean": float(auc_mean),
             "auc_std": float(auc_std),
             "cv_f1_mean_bestthr": float(f1_mean),
-            "f1_std_at_thr": float(f1_std),
+            "cv_f1_std_bestthr": float(f1_std),
             "best_iter_final": int(best_iter_final),
             "threshold_mode": "optimized" if bool(cfg.train.optimize_threshold.enable) else "fixed",
         }
@@ -1437,7 +2094,7 @@ def main(cfg: DictConfig) -> None:
         final_model = None
         print(f"[Predict] Using fold-ensemble proba (mean over {cfg.train.n_splits} folds)")
     else:
-        final_model, test_proba = fit_final_and_predict(cfg, X, y, test, cat_cols, best_iter_final)
+        final_model, test_proba = fit_final_and_predict(cfg, X_full, y, test_full, cat_cols_full, best_iter_final)
         print("[Predict] Using single final model fit on full data")
 
     test_pred = (test_proba >= threshold).astype(int)
@@ -1519,6 +2176,13 @@ def main(cfg: DictConfig) -> None:
                         for mp in meta_candidates:
                             if mp.exists() and mp.is_file():
                                 zf.write(mp, arcname=f"meta/{mp.name}")
+                        # Add fold-specific preprocessing meta (if exists)
+                        try:
+                            for mp in output_dir.glob("fold*_preprocess_meta.yaml"):
+                                if mp.exists() and mp.is_file():
+                                    zf.write(mp, arcname=f"meta/{mp.name}")
+                        except Exception as e:
+                            print(f"[Warn] adding fold preprocess meta files failed: {e}")
 
                         # Add outputs for one-shot reproducibility
                         try:
@@ -1539,7 +2203,7 @@ def main(cfg: DictConfig) -> None:
 
 
         else:
-            booster = final_model.booster_
+            booster = final_model.booster_ # type: ignore
             model_path.parent.mkdir(parents=True, exist_ok=True)
             booster.save_model(str(model_path))
             print("Saved model:", model_path)
@@ -1573,6 +2237,13 @@ def main(cfg: DictConfig) -> None:
                         for mp in meta_candidates:
                             if mp.exists() and mp.is_file():
                                 zf.write(mp, arcname=f"meta/{mp.name}")
+                        # Add fold-specific preprocessing meta (if exists)
+                        try:
+                            for mp in output_dir.glob("fold*_preprocess_meta.yaml"):
+                                if mp.exists() and mp.is_file():
+                                    zf.write(mp, arcname=f"meta/{mp.name}")
+                        except Exception as e:
+                            print(f"[Warn] adding fold preprocess meta files failed: {e}")
                     except Exception as e:
                         print(f"[Warn] adding meta files to model bundle failed: {e}")
 
@@ -1598,16 +2269,16 @@ def main(cfg: DictConfig) -> None:
             if use_fold_ensemble:
                 importances = cv_feat_imp
             else:
-                importances = final_model.feature_importances_
+                importances = final_model.feature_importances_ # type: ignore
 
             fi = pd.DataFrame({
-                "feature": X.columns,
+                "feature": X_full.columns,
                 "importance": importances,
             }).sort_values("importance", ascending=False)
             try:
-                import wandb
-                table = wandb.Table(dataframe=fi.head(200))
-                wandb.log({"feature_importance_top200": table})
+                import wandb # type: ignore
+                table = wandb.Table(dataframe=fi.head(200)) # type: ignore
+                wandb.log({"feature_importance_top200": table}) # type: ignore
             except Exception as e:
                 print(f"[Warn] feature importance logging failed: {e}")
 
@@ -1640,4 +2311,4 @@ def main(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main() # type: ignore
