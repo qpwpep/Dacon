@@ -1207,7 +1207,7 @@ def search_best_threshold(
     denom = (precision[:-1] + recall[:-1] + 1e-15)
     f1s = (2.0 * precision[:-1] * recall[:-1]) / denom
 
-    # ✅ 후보를 범위로 제한 (정확 최적 + 범위 보장)
+    # 후보를 범위로 제한 (정확 최적 + 범위 보장)
     mask = (thresholds >= min_t) & (thresholds <= max_t)
     if np.any(mask):
         cand_t = thresholds[mask]
@@ -1788,6 +1788,11 @@ def cv_train_foldfit(
             _lr_params.setdefault("n_jobs", -1)
             if str(_lr_params.get("penalty", "l2")).lower() == "elasticnet":
                 _lr_params.setdefault("l1_ratio", 0.1)
+
+            # sklearn>=1.8: n_jobs no-op, penalty deprecating for l2
+            _lr_params.pop("n_jobs", None)
+            if str(_lr_params.get("penalty", "l2")).lower() == "l2":
+                _lr_params.pop("penalty", None)  # default is already l2
 
             Xtr_txt = build_text_corpus(X_tr_raw, tfidf_cols, joiner=tfidf_joiner, add_col_tags=tfidf_add_col_tags, normalize_ws=tfidf_normalize_ws)
             Xva_txt = build_text_corpus(X_va_raw, tfidf_cols, joiner=tfidf_joiner, add_col_tags=tfidf_add_col_tags, normalize_ws=tfidf_normalize_ws)
