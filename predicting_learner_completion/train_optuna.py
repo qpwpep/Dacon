@@ -162,6 +162,23 @@ def _parse_multilabel_cell(v: Any, sep: str = ",", col_name: Optional[str] = Non
     s = str(v).strip()
     if s == "":
         return []
+
+    # previous_class_*: keep only the 4-digit class codes (e.g., "0001") to reduce dimensionality
+    if col_name is not None and str(col_name).startswith("previous_class_"):
+        # primary pattern: 4 digits right before a colon (handles "0001 : ...")
+        codes = re.findall(r"(\d{4})(?=\s*:)", s)
+        # fallback: any 4-digit code with leading zero (avoid years like 2023)
+        if not codes:
+            codes = re.findall(r"\b0\d{3}\b", s)
+
+        # dedup, keep order
+        cleaned_codes: List[str] = []
+        seen = set()
+        for c in codes:
+            if c not in seen:
+                cleaned_codes.append(c)
+                seen.add(c)
+        return cleaned_codes
     toks = _split_outside_brackets(s, sep=sep)
     # normalize whitespace
     cleaned: List[str] = []
@@ -495,6 +512,27 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         df["major_field"] = s
         df["is_major_it"] = s.fillna("").astype(str).str.contains("IT", regex=False).astype(int)
 
+    # 응답 성실도
+    base_cols = [c for c in df.columns if c not in ["completed"]]  # target 제외
+    df["__filled_cnt"] = df[base_cols].notna().sum(axis=1) # type: ignore
+    df["__filled_ratio"] = df["__filled_cnt"] / len(base_cols)
+
+    # 자유서술 길이(예: incumbents_lecture_scale_reason)
+    col = "incumbents_lecture_scale_reason"
+    if col in df.columns:
+        s = df[col].fillna("").astype(str)
+        df[col + "__len"] = s.str.len()
+        df[col + "__n_words"] = s.str.split().str.len()
+
+    # previous_class 요약(코드 존재 여부/개수)
+    prev_cols = [c for c in df.columns if c.startswith("previous_class_")]
+    if prev_cols:
+        def count_codes(row):
+            txt = " ".join([str(x) for x in row if pd.notna(x)])
+            return len(re.findall(r"\b\d{4}\b", txt))
+        df["prev_class__code_cnt"] = df[prev_cols].apply(lambda r: count_codes(r.values), axis=1)
+        df["prev_class__has_code"] = (df["prev_class__code_cnt"] > 0).astype(int)
+
     return df
 
 
@@ -507,6 +545,57 @@ def drop_high_missing_cols(
     miss = train_df.isna().mean()
     drop_cols = miss[miss > threshold].index.tolist()
     return train_df.drop(columns=drop_cols), test_df.drop(columns=drop_cols, errors="ignore"), drop_cols
+
+
+def add_missing_presence_flags_and_drop(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    threshold: float,
+    suffix: str = "__present",
+    skip_all_missing: bool = True,
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], List[str]]:
+    """Add presence flags for high-missing columns, then drop them.
+
+    - Compute missing rate on train_df.
+    - For columns with missing_rate > threshold:
+        * add <col>{suffix} = 1 if value is present else 0
+        * (optionally) skip columns that are 100% missing in train_df (flag would be constant 0)
+        * drop the original high-missing columns.
+
+    Returns:
+        train_df2, test_df2, dropped_cols, added_flag_cols
+    """
+    train_df = train_df.copy()
+    test_df = test_df.copy()
+
+    miss = train_df.isna().mean()
+    drop_cols = miss[miss > threshold].index.tolist()
+
+    added_flags: List[str] = []
+    for col in drop_cols:
+        # If the column is entirely missing in train, its presence flag is constant 0 -> usually useless
+        if skip_all_missing and float(miss.get(col, 0.0)) >= 1.0:
+            continue
+
+        new_col = f"{col}{suffix}"
+        if new_col in train_df.columns:
+            continue
+
+        if col in train_df.columns:
+            train_df[new_col] = train_df[col].notna().astype(np.int8)
+        else:
+            train_df[new_col] = np.int8(0)
+
+        if col in test_df.columns:
+            test_df[new_col] = test_df[col].notna().astype(np.int8)
+        else:
+            test_df[new_col] = np.int8(0)
+
+        added_flags.append(new_col)
+
+    train_df = train_df.drop(columns=drop_cols)
+    test_df = test_df.drop(columns=drop_cols, errors="ignore")
+    return train_df, test_df, drop_cols, added_flags
 
 
 def drop_constant_cols(
@@ -678,14 +767,36 @@ def preprocess_fold_fit(
     dropped_missing: List[str] = []
     dropped_const: List[str] = []
 
-    if other is None:
-        X_tr, _, dropped_missing = drop_high_missing_cols(
-            X_tr, X_tr.iloc[0:0].copy(), threshold=float(cfg.data.drop_missing_threshold) # type: ignore
-        )
+    # (개선) 고결측 컬럼은 값 자체 대신 '존재 여부'를 남기기 위해 is_present 플래그를 먼저 생성
+    present_enable = bool(_select(cfg, "data.missing_present_flags.enable", True))
+    present_suffix = str(_select(cfg, "data.missing_present_flags.suffix", "__present"))
+    present_skip_all_missing = bool(_select(cfg, "data.missing_present_flags.skip_all_missing", True))
+    present_cols: List[str] = []
+
+    if present_enable:
+        if other is None:
+            X_tr, _, dropped_missing, present_cols = add_missing_presence_flags_and_drop(
+                X_tr, X_tr.iloc[0:0].copy(), # type: ignore
+                threshold=float(cfg.data.drop_missing_threshold),
+                suffix=present_suffix,
+                skip_all_missing=present_skip_all_missing,
+            )
+        else:
+            X_tr, other, dropped_missing, present_cols = add_missing_presence_flags_and_drop(
+                X_tr, other,
+                threshold=float(cfg.data.drop_missing_threshold),
+                suffix=present_suffix,
+                skip_all_missing=present_skip_all_missing,
+            )
     else:
-        X_tr, other, dropped_missing = drop_high_missing_cols(
-            X_tr, other, threshold=float(cfg.data.drop_missing_threshold)
-        )
+        if other is None:
+            X_tr, _, dropped_missing = drop_high_missing_cols(
+                X_tr, X_tr.iloc[0:0].copy(), threshold=float(cfg.data.drop_missing_threshold) # type: ignore
+            )
+        else:
+            X_tr, other, dropped_missing = drop_high_missing_cols(
+                X_tr, other, threshold=float(cfg.data.drop_missing_threshold)
+            )
 
     if bool(cfg.data.drop_constant_cols):
         if other is None:
@@ -780,6 +891,12 @@ def preprocess_fold_fit(
 
         meta = {
             "dropped_missing_cols": list(dropped_missing),
+            "missing_present_flags": {
+                "enable": bool(present_enable),
+                "suffix": str(present_suffix),
+                "skip_all_missing": bool(present_skip_all_missing),
+                "flag_cols": list(present_cols),
+            },
             "dropped_constant_cols": list(dropped_const),
             "categorical_cols": list(cat_cols),
             "rare_bucket": {
@@ -1339,6 +1456,7 @@ def run_optuna_tuning(
         "subsample_freq": int(best_params["subsample_freq"]),
         "colsample_bytree": float(best_params["colsample_bytree"]),
         "max_bin": int(best_params["max_bin"]),
+        "scale_pos_weight": float(best_params["scale_pos_weight"]),
     }
 
     best_threshold = None
@@ -1895,9 +2013,24 @@ def main(cfg: DictConfig) -> None:
     if multilabel_enabled and ml_cols:
         prefixes = tuple(f"{c}__" for c in ml_cols)
         ml_generated_cols = [c for c in X_full.columns if c.startswith(prefixes)]
-
     # 결측률 높은 컬럼 드랍(train 기준)
-    X_full, test_full, dropped_missing = drop_high_missing_cols(X_full, test_full, threshold=float(cfg.data.drop_missing_threshold))
+    # (개선) 드랍 전에 고결측 컬럼의 '존재 여부(is_present)' 플래그를 생성해 신호를 보존
+    present_enable = bool(_select(cfg, "data.missing_present_flags.enable", True))
+    present_suffix = str(_select(cfg, "data.missing_present_flags.suffix", "__present"))
+    present_skip_all_missing = bool(_select(cfg, "data.missing_present_flags.skip_all_missing", True))
+    present_cols_full: List[str] = []
+
+    if present_enable:
+        X_full, test_full, dropped_missing, present_cols_full = add_missing_presence_flags_and_drop(
+            X_full, test_full,
+            threshold=float(cfg.data.drop_missing_threshold),
+            suffix=present_suffix,
+            skip_all_missing=present_skip_all_missing,
+        )
+    else:
+        X_full, test_full, dropped_missing = drop_high_missing_cols(
+            X_full, test_full, threshold=float(cfg.data.drop_missing_threshold)
+        )
 
     # 상수 컬럼 드랍(train 기준)
     dropped_const: List[str] = []
@@ -1965,6 +2098,12 @@ def main(cfg: DictConfig) -> None:
 
         preprocess_payload = {
             "dropped_missing_cols": list(dropped_missing),
+            "missing_present_flags": {
+                "enable": bool(present_enable),
+                "suffix": str(present_suffix),
+                "skip_all_missing": bool(present_skip_all_missing),
+                "flag_cols": list(present_cols_full),
+            },
             "dropped_constant_cols": list(dropped_const),
             "categorical_cols": list(cat_cols),
             "rare_bucket": {
@@ -1990,6 +2129,10 @@ def main(cfg: DictConfig) -> None:
     print("[Info] CV/Optuna uses fold-fit preprocessing on raw features (leakage-free)")
     print(f"[Info] Pos rate={y.mean():.4f} ({int(y.sum())}/{len(y)})")
     print(f"[Info] Dropped missing>{cfg.data.drop_missing_threshold}: {len(dropped_missing)} cols -> {dropped_missing}")
+    if present_enable and present_cols_full:
+        # Keep log concise
+        preview = present_cols_full if len(present_cols_full) <= 20 else present_cols_full[:20] + ['...']
+        print(f"[Info] Added is_present flags: {len(present_cols_full)} cols -> {preview}")
     if dropped_const:
         print(f"[Info] Dropped constant cols: {len(dropped_const)} cols -> {dropped_const}")
     print(f"[Info] Categorical cols (full-fit): {len(cat_cols)}")

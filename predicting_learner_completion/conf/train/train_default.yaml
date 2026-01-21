@@ -12,13 +12,13 @@ threshold: 0.2
 # Optional: search best threshold on OOF to maximize F1
 optimize_threshold:
   enable: true
-  method: grid   # pr_curve | grid
+  method: pr_curve   # pr_curve | grid
   grid:
     start: 0.10
     end: 0.60
     step: 0.01
-  clamp_min: 0.10
-  clamp_max: 0.60
+  clamp_min: 0.02
+  clamp_max: 0.98
 
 # ---------------------------
 # CatBoost sub-model (optional)

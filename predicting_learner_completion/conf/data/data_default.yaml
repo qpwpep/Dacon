@@ -12,6 +12,13 @@ drop_missing_threshold: 0.95
 # Optional: also drop constant columns (nunique <= 1 on train)
 drop_constant_cols: true
 
+# (개선) 고결측 컬럼을 드랍하기 전에 '값이 존재했는가'만 남기는 플래그를 생성
+missing_present_flags:
+  enable: true
+  suffix: "__present"
+  skip_all_missing: true
+
+
 # Treat low-cardinality numeric columns as categorical by casting to string then category
 categorical_numeric:
   enable: true
@@ -46,9 +53,15 @@ multilabel:
     - expected_domain
     - desired_certificate
     - onedayclass_topic
+    - previous_class_3
+    - previous_class_4
+    - previous_class_5
+    - previous_class_6
+    - previous_class_7
+    - previous_class_8
   sep: ","
-  min_freq: 3     # keep tokens that appear >= min_freq in TRAIN
-  top_k: 50       # keep only the most frequent top_k tokens per column (set null for no limit)
+  min_freq: 2     # keep tokens that appear >= min_freq in TRAIN
+  top_k: 120       # keep only the most frequent top_k tokens per column (set null for no limit)
   add_other: true # <col>__ml_other: 1 if any token is outside vocab
   add_count: true # <col>__ml_count: number of tokens
   drop_original: true
