@@ -43,17 +43,62 @@ catboost:
     verbose: ${train.log_period}
 
 # ---------------------------
+# TF-IDF(char ngram) + LogisticRegression (optional)
+# ---------------------------
+tfidf_lr:
+  enable: true
+  # Text columns to concatenate (raw df columns; missing cols are ignored)
+  cols:
+    - whyBDA
+    - what_to_gain
+    - hope_for_group
+    - desired_career_path
+    - incumbents_lecture_scale_reason
+    - contest_participation
+    - onedayclass_topic
+    - expected_domain
+  joiner: "\n"
+  add_col_tags: true
+  normalize_ws: true
+  save_model: false   # save per-fold joblib when train.save_model && use_fold_ensemble
+
+  tfidf:
+    analyzer: char
+    ngram_range: [3, 5]
+    min_df: 2
+    max_df: 0.95
+    sublinear_tf: true
+    max_features: 200000
+
+  lr:
+    solver: saga
+    penalty: l2
+    C: 4.0
+    class_weight: balanced
+    max_iter: 6000
+    n_jobs: -1
+
+# ---------------------------
 # Ensemble (LGB + CatBoost)
 # ---------------------------
 ensemble:
   enable: true
   weight_search:
     enable: true
-    # weight is for LGB. CatBoost weight = 1 - w_lgb
+    # Weights:
+    # - 2 models: (LGB + CatBoost) or (LGB + TF-IDF+LR)
+    # - 3 models: (LGB + CatBoost + TF-IDF+LR)
+    # Search variables:
+    # - w_lgb in [min_w_lgb, max_w_lgb]
+    # - w_cb  in [min_w_cb,  max_w_cb]  (only when CatBoost is enabled)
+    # - w_tfidf_lr is the residual: 1 - w_lgb - w_cb (clipped/normalized safely)
     min_w_lgb: 0.0
     max_w_lgb: 1.0
+    min_w_cb: 0.0
+    max_w_cb: 1.0
     step: 0.01
-    default_w_lgb: 0.5
+    default_w_lgb: 0.6
+    default_w_cb: 0.2
 
 # Outputs (saved inside Hydra run dir)
 out_path: submit_lgbm.csv

@@ -14,6 +14,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np # type: ignore
 import pandas as pd # type: ignore
 
+# Optional: TF-IDF(char ngram) + LogisticRegression text model
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
+    from sklearn.linear_model import LogisticRegression  # type: ignore
+    from sklearn.pipeline import Pipeline  # type: ignore
+except Exception:  # pragma: no cover
+    TfidfVectorizer = None  # type: ignore
+    LogisticRegression = None  # type: ignore
+    Pipeline = None  # type: ignore
+
 from sklearn.model_selection import StratifiedKFold # type: ignore
 from sklearn.metrics import roc_auc_score, f1_score, precision_recall_curve # type: ignore
 from sklearn.preprocessing import MultiLabelBinarizer # type: ignore
@@ -485,9 +495,6 @@ def clean_completed_semester_series(
     return cleaned, invalid
 
 
-
-
-
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """대회 컬럼 구성에 맞춘 최소 파생피처."""
     df = df.copy()
@@ -534,6 +541,45 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         df["prev_class__has_code"] = (df["prev_class__code_cnt"] > 0).astype(int)
 
     return df
+
+
+def build_text_corpus(
+    df: pd.DataFrame,
+    cols: List[str],
+    *,
+    joiner: str = "\n",
+    add_col_tags: bool = True,
+    normalize_ws: bool = True,
+) -> List[str]:
+    """Build per-row text by concatenating selected columns.
+
+    - cols: list of column names to use (missing cols are ignored)
+    - add_col_tags: if True, prefix each part with [colname] for disambiguation
+    - normalize_ws: apply whitespace normalization
+    """
+    if not cols:
+        return [""] * len(df)
+
+    parts = []
+    for c in cols:
+        if c not in df.columns:
+            continue
+        s = df[c].fillna("").astype(str)
+        if normalize_ws:
+            s = normalize_blank_series(s).fillna("").astype(str)  # unify blanks -> ""
+            s = s.apply(lambda x: " ".join(str(x).split()))
+        if add_col_tags:
+            parts.append(("[{}] ".format(c) + s).tolist())
+        else:
+            parts.append(s.tolist())
+
+    if not parts:
+        return [""] * len(df)
+
+    out = []
+    for row_parts in zip(*parts):
+        out.append(joiner.join(row_parts))
+    return out
 
 
 def drop_high_missing_cols(
@@ -1518,7 +1564,7 @@ def cv_train_foldfit(
     feature_columns_ref: List[str],
     save_fold_models: bool = False,
     fold_model_basepath: Optional[Path] = None,
-) -> Tuple[np.ndarray, np.ndarray, List[int], List[float], List[float], List[Path], np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, List[int], List[float], List[float], List[Path], np.ndarray, Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, Any]]:
     """CV 학습 (fold-fit 전처리로 누수 제거).
 
     feature_importance는 fold마다 feature space가 달라질 수 있으므로,
@@ -1529,7 +1575,11 @@ def cv_train_foldfit(
 
     # --- CatBoost (submodel) + Ensemble weight search config ---
     cb_enable = bool(_select(cfg, "train.catboost.enable", False))
-    ens_enable = bool(_select(cfg, "train.ensemble.enable", True)) if cb_enable else False
+    # TF-IDF(char ngram) + LogisticRegression (optional text sub-model)
+    tfidf_enable = bool(_select(cfg, "train.tfidf_lr.enable", False))
+    # Ensemble is meaningful only when any sub-model is enabled
+    submodels_enabled = bool(cb_enable or tfidf_enable)
+    ens_enable = bool(_select(cfg, "train.ensemble.enable", True)) if submodels_enabled else False
     weight_search_enable = bool(_select(cfg, "train.ensemble.weight_search.enable", True)) if ens_enable else False
 
     # If user enabled CatBoost but package isn't installed -> fail fast
@@ -1538,6 +1588,25 @@ def cv_train_foldfit(
             "CatBoost is enabled (train.catboost.enable=true) but catboost is not installed. "
             "Run: pip install catboost"
         )
+
+    # If user enabled TF-IDF+LR but scikit-learn isn't available -> fail fast
+    if tfidf_enable and (TfidfVectorizer is None or LogisticRegression is None or Pipeline is None):
+        raise ImportError(
+            "TF-IDF+LR is enabled (train.tfidf_lr.enable=true) but scikit-learn is not available. "
+            "Run: pip install scikit-learn"
+        )
+
+    # Text model config (safe defaults)
+    tfidf_cols = list(_select(cfg, "train.tfidf_lr.cols", [])) or ["incumbents_lecture_scale_reason"]
+    tfidf_joiner = str(_select(cfg, "train.tfidf_lr.joiner", "\n"))
+    tfidf_add_col_tags = bool(_select(cfg, "train.tfidf_lr.add_col_tags", True))
+    tfidf_normalize_ws = bool(_select(cfg, "train.tfidf_lr.normalize_ws", True))
+    tfidf_params = dict(_select(cfg, "train.tfidf_lr.tfidf", {}) or {})
+    lr_params = dict(_select(cfg, "train.tfidf_lr.lr", {}) or {})
+    # Normalize special params
+    ngram = tfidf_params.get("ngram_range", [3, 5])
+    if isinstance(ngram, (list, tuple)) and len(ngram) == 2:
+        tfidf_params["ngram_range"] = (int(ngram[0]), int(ngram[1]))
 
     skf = StratifiedKFold(
         n_splits=int(cfg.train.n_splits),
@@ -1553,6 +1622,10 @@ def cv_train_foldfit(
     oof_cb = np.zeros(len(X_raw), dtype=float) if cb_enable else None
     test_sum_cb = np.zeros(len(test_raw), dtype=float) if cb_enable else None
 
+    # Sub(TF-IDF+LR) OOF/test proba (optional)
+    oof_tfidf = np.zeros(len(X_raw), dtype=float) if tfidf_enable else None
+    test_sum_tfidf = np.zeros(len(test_raw), dtype=float) if tfidf_enable else None
+
     # feature importance: name 기반 누적
     feat_imp_sum: Dict[str, float] = {}
 
@@ -1564,6 +1637,8 @@ def cv_train_foldfit(
     f1s_lgb: List[float] = []
     aucs_cb: List[float] = []
     f1s_cb: List[float] = []
+    aucs_tfidf: List[float] = []
+    f1s_tfidf: List[float] = []
     fold_va_indices: List[np.ndarray] = []  # for recomputing blended fold metrics after weight search
 
     aucs: List[float] = []
@@ -1687,7 +1762,82 @@ def cv_train_foldfit(
             fold_model_paths.append(fold_path)
 
         # -------------------
-        # 2) CatBoost (optional)
+        # 2) TF-IDF(char ngram) + LogisticRegression (optional)
+        # -------------------
+        if tfidf_enable:
+            _tfidf_params = dict(tfidf_params)
+            _lr_params = dict(lr_params)
+            _tfidf_params.setdefault("analyzer", "char")
+            _tfidf_params.setdefault("ngram_range", (3, 5))
+            _tfidf_params.setdefault("min_df", 2)
+            _tfidf_params.setdefault("max_df", 0.95)
+            _tfidf_params.setdefault("sublinear_tf", True)
+            _tfidf_params.setdefault("max_features", 200000)
+
+            ng = _tfidf_params.get("ngram_range", (3, 5))
+            if isinstance(ng, (list, tuple)) and len(ng) == 2:
+                _tfidf_params["ngram_range"] = (int(ng[0]), int(ng[1]))
+            else:
+                _tfidf_params["ngram_range"] = (3, 5)
+
+            _lr_params.setdefault("solver", "saga")
+            _lr_params.setdefault("penalty", "l2")
+            _lr_params.setdefault("C", 4.0)
+            _lr_params.setdefault("class_weight", "balanced")
+            _lr_params.setdefault("max_iter", 6000)
+            _lr_params.setdefault("n_jobs", -1)
+            if str(_lr_params.get("penalty", "l2")).lower() == "elasticnet":
+                _lr_params.setdefault("l1_ratio", 0.1)
+
+            Xtr_txt = build_text_corpus(X_tr_raw, tfidf_cols, joiner=tfidf_joiner, add_col_tags=tfidf_add_col_tags, normalize_ws=tfidf_normalize_ws)
+            Xva_txt = build_text_corpus(X_va_raw, tfidf_cols, joiner=tfidf_joiner, add_col_tags=tfidf_add_col_tags, normalize_ws=tfidf_normalize_ws)
+            Xte_txt = build_text_corpus(test_raw,  tfidf_cols, joiner=tfidf_joiner, add_col_tags=tfidf_add_col_tags, normalize_ws=tfidf_normalize_ws)
+
+            text_model = Pipeline(steps=[("tfidf", TfidfVectorizer(**_tfidf_params)), ("lr", LogisticRegression(**_lr_params))]) # type: ignore
+            text_model.fit(Xtr_txt, y_tr.values)
+
+            proba_va_tfidf = text_model.predict_proba(Xva_txt)[:, 1]
+            oof_tfidf[va_idx] = proba_va_tfidf  # type: ignore
+            proba_te_tfidf = text_model.predict_proba(Xte_txt)[:, 1]
+            test_sum_tfidf += proba_te_tfidf  # type: ignore
+
+            auc_tfidf = float(roc_auc_score(y_va, proba_va_tfidf))
+            fixed_thr = float(cfg.train.threshold)
+            f1_fixed_tfidf = float(f1_score(y_va, (proba_va_tfidf >= fixed_thr).astype(int)))
+            if bool(cfg.train.optimize_threshold.enable):
+                tfidf_best_thr, tfidf_f1_best = search_best_threshold(
+                    y_true=y_va.values, proba=proba_va_tfidf,
+                    method=str(_select(cfg, "train.optimize_threshold.method", "pr_curve")),
+                    min_t=float(cfg.train.optimize_threshold.clamp_min),
+                    max_t=float(cfg.train.optimize_threshold.clamp_max),
+                    grid_start=float(_select(cfg, "train.optimize_threshold.grid.start", _select(cfg, "train.optimize_threshold.grid_start", 0.05))),
+                    grid_end=float(_select(cfg, "train.optimize_threshold.grid.end", _select(cfg, "train.optimize_threshold.grid_end", 0.95))),
+                    grid_step=float(_select(cfg, "train.optimize_threshold.grid.step", _select(cfg, "train.optimize_threshold.grid_step", 0.01))),
+                )
+                tfidf_best_thr = float(tfidf_best_thr)
+                f1_tfidf = float(tfidf_f1_best)
+            else:
+                tfidf_best_thr = float(fixed_thr)
+                f1_tfidf = float(f1_fixed_tfidf)
+
+            aucs_tfidf.append(auc_tfidf)
+            f1s_tfidf.append(f1_tfidf)
+
+            print(f"[Fold {fold}][TF ] AUC={auc_tfidf:.5f} | F1_best@{tfidf_best_thr:.3f}={f1_tfidf:.5f} | F1_fixed@{fixed_thr:.3f}={f1_fixed_tfidf:.5f}")
+            wandb_log(run, {"cv/tfidf_lr/auc": float(auc_tfidf), "cv/tfidf_lr/f1": float(f1_tfidf), "cv/tfidf_lr/f1_fixed": float(f1_fixed_tfidf), "cv/tfidf_lr/best_threshold": float(tfidf_best_thr)}, step=fold)
+
+            if save_fold_models and bool(_select(cfg, "train.tfidf_lr.save_model", False)) and fold_model_basepath is not None:
+                try:
+                    import joblib  # type: ignore
+                    base = fold_model_basepath
+                    fold_path = base.with_name(f"{base.stem}_tfidf_lr_fold{fold}.joblib")
+                    fold_path.parent.mkdir(parents=True, exist_ok=True)
+                    joblib.dump(text_model, fold_path)
+                except Exception as e:
+                    print(f"[Warn] saving TF-IDF+LR fold model failed: {e}")
+
+        # -------------------
+        # 3) CatBoost (optional)
         # -------------------
         if cb_enable:
             cb_params = dict(_select(cfg, "train.catboost.params", {}) or {})
@@ -1783,62 +1933,166 @@ def cv_train_foldfit(
     n_splits = int(cfg.train.n_splits)
     test_lgb_mean = test_sum_lgb / n_splits
 
-    # Decide what to return: LGB-only vs Blended(LGB+CB)
-    if ens_enable and cb_enable and (oof_cb is not None) and (test_sum_cb is not None):
-        # ----- weight search on full OOF (maximize Binary F1) -----
-        w_min = float(_select(cfg, "train.ensemble.weight_search.min_w_lgb", 0.0))
-        w_max = float(_select(cfg, "train.ensemble.weight_search.max_w_lgb", 1.0))
-        w_step = float(_select(cfg, "train.ensemble.weight_search.step", 0.01))
-        w_default = float(_select(cfg, "train.ensemble.weight_search.default_w_lgb", 0.5))
+    # Decide what to return: LGB-only vs Ensemble (LGB + optional submodels)
+    # ---------------------------------------------------------------
+    # Available OOF/test parts
+    oof_parts: Dict[str, np.ndarray] = {"lgb": oof_lgb}
+    test_parts: Dict[str, np.ndarray] = {"lgb": test_lgb_mean}
+    model_keys: List[str] = ["lgb"]
 
-        def _eval_f1_with_threshold(proba_mix: np.ndarray) -> Tuple[float, float]:
+    if cb_enable and (oof_cb is not None) and (test_sum_cb is not None):
+        test_cb_mean = (test_sum_cb / n_splits)  # type: ignore
+        oof_parts["catboost"] = oof_cb  # type: ignore
+        test_parts["catboost"] = test_cb_mean
+        model_keys.append("catboost")
+
+    if tfidf_enable and (oof_tfidf is not None) and (test_sum_tfidf is not None):
+        test_tfidf_mean = (test_sum_tfidf / n_splits)  # type: ignore
+        oof_parts["tfidf_lr"] = oof_tfidf  # type: ignore
+        test_parts["tfidf_lr"] = test_tfidf_mean
+        model_keys.append("tfidf_lr")
+
+    # Defensive: compute ensemble flags here as well
+    _submodels_enabled = (len(model_keys) >= 2)
+    ens_flag = bool(_select(cfg, "train.ensemble.enable", True)) if _submodels_enabled else False
+    weight_search_enable = bool(_select(cfg, "train.ensemble.weight_search.enable", True)) if ens_flag else False
+
+    # (옵션) main()에서 threshold.yaml 등에 같이 저장하려면 이 dict를 반환/저장하도록 확장 가능
+    ensemble_meta: Dict[str, Any] = {"enable": 0, "weights": {"lgb": 1.0}, "weight_search_enable": int(weight_search_enable)}
+
+    if ens_flag:
+        # --------------------------
+        # Weight search configuration
+        # --------------------------
+        w_lgb_min = float(_select(cfg, "train.ensemble.weight_search.min_w_lgb", 0.0))
+        w_lgb_max = float(_select(cfg, "train.ensemble.weight_search.max_w_lgb", 1.0))
+        w_cb_min = float(_select(cfg, "train.ensemble.weight_search.min_w_cb", 0.0))
+        w_cb_max = float(_select(cfg, "train.ensemble.weight_search.max_w_cb", 1.0))
+        w_step = float(_select(cfg, "train.ensemble.weight_search.step", 0.01))
+
+        w_lgb_default = float(_select(cfg, "train.ensemble.weight_search.default_w_lgb", 0.6))
+        w_cb_default = float(_select(cfg, "train.ensemble.weight_search.default_w_cb", 0.2))
+
+        if w_step <= 0:
+            w_step = 0.01
+        if w_lgb_min > w_lgb_max:
+            w_lgb_min, w_lgb_max = w_lgb_max, w_lgb_min
+        if w_cb_min > w_cb_max:
+            w_cb_min, w_cb_max = w_cb_max, w_cb_min
+
+        def _eval_f1_with_threshold(y_true: np.ndarray, proba: np.ndarray) -> Tuple[float, float]:
             fixed_thr = float(cfg.train.threshold)
             if bool(cfg.train.optimize_threshold.enable):
                 t_best, f1_best = search_best_threshold(
-                    y_true=y.values,
-                    proba=proba_mix,
+                    y_true=y_true,
+                    proba=proba,
                     method=str(_select(cfg, "train.optimize_threshold.method", "pr_curve")),
                     min_t=float(cfg.train.optimize_threshold.clamp_min),
                     max_t=float(cfg.train.optimize_threshold.clamp_max),
                     grid_start=float(_select(cfg, "train.optimize_threshold.grid.start",
                                             _select(cfg, "train.optimize_threshold.grid_start", 0.05))),
                     grid_end=float(_select(cfg, "train.optimize_threshold.grid.end",
-                                        _select(cfg, "train.optimize_threshold.grid_end", 0.95))),
+                                          _select(cfg, "train.optimize_threshold.grid_end", 0.95))),
                     grid_step=float(_select(cfg, "train.optimize_threshold.grid.step",
-                                        _select(cfg, "train.optimize_threshold.grid_step", 0.01))),
+                                           _select(cfg, "train.optimize_threshold.grid_step", 0.01))),
                 )
                 return float(t_best), float(f1_best)
             else:
-                f1_fixed = float(f1_score(y.values, (proba_mix >= fixed_thr).astype(int)))
+                f1_fixed = float(f1_score(y_true, (proba >= fixed_thr).astype(int)))
                 return float(fixed_thr), float(f1_fixed)
 
-        best_w = w_default
+        def _mix_proba(weights: Dict[str, float], parts: Dict[str, np.ndarray]) -> np.ndarray:
+            out = np.zeros_like(next(iter(parts.values())), dtype=float)
+            for k, w in weights.items():
+                out += float(w) * parts[k]
+            return out
+
+        # --------------------------
+        # Weight search (2-model / 3-model)
+        # --------------------------
+        best_weights: Dict[str, float] = {"lgb": 1.0}
         best_thr = float(cfg.train.threshold)
         best_f1 = -1.0
 
-        if weight_search_enable:
-            if w_step <= 0:
-                w_step = 0.01
-            if w_min > w_max:
-                w_min, w_max = w_max, w_min
-            grid = np.arange(w_min, w_max + 1e-12, w_step, dtype=float)
-            for w_lgb in grid:
-                proba_mix = (w_lgb * oof_lgb) + ((1.0 - w_lgb) * oof_cb)  # type: ignore
-                t, f1v = _eval_f1_with_threshold(proba_mix)
-                if f1v > best_f1:
-                    best_f1 = f1v
-                    best_w = float(w_lgb)
-                    best_thr = float(t)
-        else:
-            proba_mix = (best_w * oof_lgb) + ((1.0 - best_w) * oof_cb)  # type: ignore
-            best_thr, best_f1 = _eval_f1_with_threshold(proba_mix)
+        if len(model_keys) == 2:
+            other = model_keys[1]
+            # default weights
+            w_lgb = float(np.clip(w_lgb_default, w_lgb_min, w_lgb_max))
+            best_weights = {"lgb": w_lgb, other: 1.0 - w_lgb}
 
-        # final blended outputs
-        oof_proba = (best_w * oof_lgb) + ((1.0 - best_w) * oof_cb)  # type: ignore
-        test_cb_mean = (test_sum_cb / n_splits)  # type: ignore
-        test_proba_mean = (best_w * test_lgb_mean) + ((1.0 - best_w) * test_cb_mean)
+            if weight_search_enable:
+                grid = np.arange(w_lgb_min, w_lgb_max + 1e-12, w_step, dtype=float)
+                for w_lgb in grid:
+                    weights = {"lgb": float(w_lgb), other: float(1.0 - w_lgb)}
+                    proba_mix = _mix_proba(weights, oof_parts)
+                    t, f1v = _eval_f1_with_threshold(y.values, proba_mix)
+                    if f1v > best_f1:
+                        best_f1 = f1v
+                        best_thr = t
+                        best_weights = weights
+            else:
+                proba_mix = _mix_proba(best_weights, oof_parts)
+                best_thr, best_f1 = _eval_f1_with_threshold(y.values, proba_mix)
 
-        # recompute fold metrics with the selected weight (so main() prints the blended CV summary)
+        elif len(model_keys) >= 3:
+            # Preferred: (lgb + catboost + tfidf_lr)
+            have_cb = ("catboost" in model_keys)
+            have_tf = ("tfidf_lr" in model_keys)
+            if not (have_cb and have_tf):
+                # fallback: use first 2 keys as explicit, residual to the 3rd
+                k1, k2, k3 = model_keys[:3]
+            else:
+                k1, k2, k3 = "lgb", "catboost", "tfidf_lr"
+
+            # default weights: (w_lgb_default, w_cb_default, residual)
+            w1 = float(np.clip(w_lgb_default, w_lgb_min, w_lgb_max))
+            w2 = float(np.clip(w_cb_default, w_cb_min, w_cb_max))
+            w3 = float(max(0.0, 1.0 - w1 - w2))
+            s = w1 + w2 + w3
+            if s <= 0:
+                w1, w2, w3 = 1.0, 0.0, 0.0
+            else:
+                w1, w2, w3 = w1 / s, w2 / s, w3 / s
+            best_weights = {k1: w1, k2: w2, k3: w3}
+
+            if weight_search_enable:
+                grid_lgb = np.arange(w_lgb_min, w_lgb_max + 1e-12, w_step, dtype=float)
+                grid_cb = np.arange(w_cb_min, w_cb_max + 1e-12, w_step, dtype=float)
+
+                for w_lgb in grid_lgb:
+                    for w_cb in grid_cb:
+                        w_res = 1.0 - float(w_lgb) - float(w_cb)
+                        if w_res < 0:
+                            continue
+                        weights = {k1: float(w_lgb), k2: float(w_cb), k3: float(w_res)}
+                        proba_mix = _mix_proba(weights, oof_parts)
+                        t, f1v = _eval_f1_with_threshold(y.values, proba_mix)
+                        if f1v > best_f1:
+                            best_f1 = f1v
+                            best_thr = t
+                            best_weights = weights
+            else:
+                proba_mix = _mix_proba(best_weights, oof_parts)
+                best_thr, best_f1 = _eval_f1_with_threshold(y.values, proba_mix)
+
+        # --------------------------
+        # Apply best weights to OOF/test
+        # --------------------------
+        oof_proba = _mix_proba(best_weights, oof_parts)
+        test_proba_mean = _mix_proba(best_weights, test_parts)
+
+        ensemble_meta = {
+            "enable": 1,
+            "weight_search_enable": int(weight_search_enable),
+            "weights": {k: float(v) for k, v in best_weights.items()},
+            "oof_best_threshold": float(best_thr),
+            "oof_best_f1": float(best_f1),
+            "oof_auc": float(roc_auc_score(y.values, oof_proba)),
+        }
+
+        # --------------------------
+        # Recompute fold metrics with selected weights
+        # --------------------------
         aucs = []
         f1s = []
         for fold, va_idx in enumerate(fold_va_indices, start=1):
@@ -1858,37 +2112,40 @@ def cv_train_foldfit(
                     grid_start=float(_select(cfg, "train.optimize_threshold.grid.start",
                                             _select(cfg, "train.optimize_threshold.grid_start", 0.05))),
                     grid_end=float(_select(cfg, "train.optimize_threshold.grid.end",
-                                        _select(cfg, "train.optimize_threshold.grid_end", 0.95))),
+                                          _select(cfg, "train.optimize_threshold.grid_end", 0.95))),
                     grid_step=float(_select(cfg, "train.optimize_threshold.grid.step",
-                                        _select(cfg, "train.optimize_threshold.grid_step", 0.01))),
+                                           _select(cfg, "train.optimize_threshold.grid_step", 0.01))),
                 )
                 f1_mix = float(f1_fold)
                 t_mix = float(t_fold)
             else:
                 f1_mix = float(f1_fixed)
                 t_mix = float(fixed_thr)
+
             aucs.append(auc_mix)
             f1s.append(f1_mix)
 
-            wandb_log(run, {
+            # Per-fold logging
+            log_payload = {
                 "cv/blend/auc": float(auc_mix),
                 "cv/blend/f1": float(f1_mix),
                 "cv/blend/best_threshold": float(t_mix),
-                "cv/blend/w_lgb": float(best_w),
-            }, step=fold)
+            }
+            for k, w in best_weights.items():
+                log_payload[f"cv/blend/w_{k}"] = float(w)
+            wandb_log(run, log_payload)
 
-        # Log ensemble summary
-        wandb_log(run, {
+        # Summary logging
+        sum_payload = {
             "ensemble/enable": 1,
             "ensemble/weight_search_enable": int(weight_search_enable),
-            "ensemble/best_w_lgb": float(best_w),
-            "ensemble/best_w_cb": float(1.0 - best_w),
             "ensemble/oof_best_threshold": float(best_thr),
             "ensemble/oof_best_f1": float(best_f1),
             "ensemble/oof_auc": float(roc_auc_score(y.values, oof_proba)),
-            "cv/lgb/f1_mean": float(np.mean(f1s_lgb)) if f1s_lgb else None,
-            "cv/cb/f1_mean": float(np.mean(f1s_cb)) if f1s_cb else None,
-        })
+        }
+        for k, w in best_weights.items():
+            sum_payload[f"ensemble/best_w_{k}"] = float(w)
+        wandb_log(run, sum_payload)
 
     else:
         # LGB-only
@@ -1900,7 +2157,7 @@ def cv_train_foldfit(
     # feature importance를 reference column에 맞춰 정렬
     feat_imp_mean = np.array([feat_imp_sum.get(c, 0.0) / n_splits for c in feature_columns_ref], dtype=float)
 
-    return oof_proba, test_proba_mean, best_iters, aucs, f1s, fold_model_paths, feat_imp_mean
+    return oof_proba, test_proba_mean, best_iters, aucs, f1s, fold_model_paths, feat_imp_mean, oof_parts, test_parts, ensemble_meta
 
 
 
@@ -2163,7 +2420,7 @@ def main(cfg: DictConfig) -> None:
     save_fold_models = bool(cfg.train.save_model) and use_fold_ensemble
     fold_model_basepath = Path(cfg.train.model_path) if save_fold_models else None
 
-    oof_proba, test_proba_cv, best_iters, aucs, f1s, fold_model_paths, cv_feat_imp = cv_train_foldfit(
+    oof_proba, test_proba_cv, best_iters, aucs, f1s, fold_model_paths, cv_feat_imp, oof_parts, test_parts, ensemble_meta = cv_train_foldfit(
         cfg, X_raw, y, test_raw, run, feature_columns_ref=list(X_full.columns),
         save_fold_models=save_fold_models,
         fold_model_basepath=fold_model_basepath,
@@ -2218,6 +2475,9 @@ def main(cfg: DictConfig) -> None:
             "best_iter_final": int(best_iter_final),
             "threshold_mode": "optimized" if bool(cfg.train.optimize_threshold.enable) else "fixed",
         }
+        # Include ensemble meta (weights, etc.) when available
+        if isinstance(ensemble_meta, dict) and int(ensemble_meta.get("enable", 0)) == 1:
+            threshold_payload["ensemble"] = ensemble_meta
         save_yaml_in_output_dir("threshold.yaml", threshold_payload)
     except Exception as e:
         print(f"[Warn] saving threshold meta failed: {e}")
@@ -2226,7 +2486,15 @@ def main(cfg: DictConfig) -> None:
 
     # Save OOF
     oof_path = Path(cfg.train.oof_path)
-    pd.DataFrame({"oof_proba": oof_proba, "y_true": y.values}).to_csv(oof_path, index=False)
+    oof_df: Dict[str, Any] = {"oof_proba": oof_proba, "y_true": y.values}
+    # Also save per-model OOF components for easy ensembling/debugging
+    if isinstance(oof_parts, dict):
+        for k, v in oof_parts.items():
+            try:
+                oof_df[f"oof_{k}"] = np.asarray(v)
+            except Exception:
+                pass
+    pd.DataFrame(oof_df).to_csv(oof_path, index=False)
     print("Saved OOF:", oof_path)
     if run is not None and bool(cfg.wandb.log_artifacts):
         wandb_log_artifact(run, oof_path, name=make_wandb_artifact_name(cfg, run, "oof_proba"), art_type="dataset")
