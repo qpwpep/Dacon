@@ -74,3 +74,4 @@ search_space:
     high: 1.0
   max_bin:
     choices: [127, 255, 511]
+  scale_pos_weight: { low: 1.0, high: 4.0, log: true }

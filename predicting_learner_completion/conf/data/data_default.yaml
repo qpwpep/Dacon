@@ -62,6 +62,23 @@ multilabel:
   sep: ","
   min_freq: 2     # keep tokens that appear >= min_freq in TRAIN
   top_k: 120       # keep only the most frequent top_k tokens per column (set null for no limit)
+  # 컬럼별 override (희소도가 큰 컬럼만 더 강하게 컷)
+  # - 회사명(interested_company): 자유입력 성격 → min_freq↑, top_k↓로 과적합 방지
+  # - 자격증(certificate_acquisition / desired_certificate): 표기 다양성/희소 토큰 많음 → min_freq↑
+  # - 도메인(expected_domain): 선택지형(저카디널) → 기본값 유지 + top_k 무제한(null)
+  per_col:
+    interested_company:
+      min_freq: 3
+      top_k: 60
+    certificate_acquisition:
+      min_freq: 3
+      top_k: null
+    desired_certificate:
+      min_freq: 3
+      top_k: null
+    expected_domain:
+      min_freq: 2
+      top_k: null
   add_other: true # <col>__ml_other: 1 if any token is outside vocab
   add_count: true # <col>__ml_count: number of tokens
   drop_original: true

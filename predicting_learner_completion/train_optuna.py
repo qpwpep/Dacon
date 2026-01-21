@@ -241,12 +241,14 @@ def expand_multilabel_columns(
     add_other: bool = True,
     add_count: bool = True,
     drop_original: bool = True,
+    per_col: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     """Expand comma-separated multi-label columns into (top-K) multi-hot columns.
 
     - Vocabulary is built ONLY from train_df (no leakage).
     - Tokens with freq < min_freq are dropped from explicit columns.
     - If top_k is not None, keep only the most frequent top_k tokens.
+    - You can override (min_freq/top_k) per column via per_col={col: {min_freq, top_k}}.
     - Optionally adds:
         * <col>__ml_count : number of tokens in the cell
         * <col>__ml_other : 1 if any token is outside the selected vocab
@@ -271,11 +273,30 @@ def expand_multilabel_columns(
         exploded = tr_lists.explode()
         vc = exploded.dropna().astype(str).value_counts()
         vc = vc[vc.index.astype(str).str.len() > 0]
-        # apply min_freq and top_k
-        selected = vc[vc >= int(min_freq)].index.astype(str).tolist()
-        if top_k is not None:
-            selected = selected[: int(top_k)]
+        # apply min_freq/top_k (optionally overridden per column)
+        col_overrides: Dict[str, Any] = {}
+        if per_col is not None:
+            try:
+                col_overrides = per_col.get(col, {})  # type: ignore[attr-defined]
+            except Exception:
+                col_overrides = {}
 
+        try:
+            min_freq_col = int(col_overrides.get("min_freq", min_freq))
+        except Exception:
+            min_freq_col = int(min_freq)
+        if min_freq_col < 1:
+            min_freq_col = 1
+
+        top_k_col = col_overrides.get("top_k", top_k)
+        try:
+            top_k_col = None if top_k_col is None else int(top_k_col)
+        except Exception:
+            top_k_col = top_k
+
+        selected = vc[vc >= min_freq_col].index.astype(str).tolist()
+        if top_k_col is not None:
+            selected = selected[: top_k_col]
         selected_set = set(selected)
 
         # build column names (stable + unique)
@@ -331,8 +352,9 @@ def expand_multilabel_columns(
 
         # meta
         info[col] = {
-            "min_freq": int(min_freq),
-            "top_k": int(top_k) if top_k is not None else None,
+            "min_freq": int(min_freq_col),
+            "top_k": int(top_k_col) if top_k_col is not None else None,
+            "overrides": {"min_freq": col_overrides.get("min_freq"), "top_k": col_overrides.get("top_k")} if col_overrides else {},
             "n_unique_tokens_train": int(len(vc)),
             "n_selected_tokens": int(len(selected)),
             "selected_tokens_preview": selected[:30],
@@ -778,6 +800,8 @@ def preprocess_fold_fit(
         top_k_val = _select(cfg, "data.multilabel.top_k", 50)
         top_k_val = None if top_k_val is None else int(top_k_val)
 
+        per_col_cfg = _select(cfg, "data.multilabel.per_col", None)
+
         if other is None:
             X_tr, _, multilabel_info = expand_multilabel_columns(
                 train_df=X_tr,
@@ -789,6 +813,7 @@ def preprocess_fold_fit(
                 add_other=bool(_select(cfg, "data.multilabel.add_other", True)),
                 add_count=bool(_select(cfg, "data.multilabel.add_count", True)),
                 drop_original=bool(_select(cfg, "data.multilabel.drop_original", True)),
+                per_col=per_col_cfg,
             )
         else:
             X_tr, other, multilabel_info = expand_multilabel_columns(
@@ -801,6 +826,7 @@ def preprocess_fold_fit(
                 add_other=bool(_select(cfg, "data.multilabel.add_other", True)),
                 add_count=bool(_select(cfg, "data.multilabel.add_count", True)),
                 drop_original=bool(_select(cfg, "data.multilabel.drop_original", True)),
+                per_col=per_col_cfg,
             )
 
     # 멀티라벨 파생 컬럼 목록(나중에 categorical 후보에서 제외)
@@ -2256,6 +2282,8 @@ def main(cfg: DictConfig) -> None:
         if ml_cols:
             top_k_val = _select(cfg, "data.multilabel.top_k", 50)
             top_k_val = None if top_k_val is None else int(top_k_val)
+
+            per_col_cfg = _select(cfg, "data.multilabel.per_col", None)
             X_full, test_full, multilabel_info = expand_multilabel_columns(
                 train_df=X_full,
                 test_df=test_full,
@@ -2266,6 +2294,7 @@ def main(cfg: DictConfig) -> None:
                 add_other=bool(_select(cfg, "data.multilabel.add_other", True)),
                 add_count=bool(_select(cfg, "data.multilabel.add_count", True)),
                 drop_original=bool(_select(cfg, "data.multilabel.drop_original", True)),
+                per_col=per_col_cfg,
             )
         else:
             multilabel_enabled = False

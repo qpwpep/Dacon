@@ -41,6 +41,7 @@ catboost:
     allow_writing_files: false
     task_type: "CPU"     # "GPU" 가능(환경에 맞게)
     verbose: ${train.log_period}
+    auto_class_weights: Balanced
 
 # ---------------------------
 # TF-IDF(char ngram) + LogisticRegression (optional)
@@ -50,21 +51,21 @@ tfidf_lr:
   # Text columns to concatenate (raw df columns; missing cols are ignored)
   cols:
     - whyBDA
-    - what_to_gain
-    - hope_for_group
-    - desired_career_path
+    # - what_to_gain
+    # - hope_for_group
+    # - desired_career_path
     - incumbents_lecture_scale_reason
-    - contest_participation
-    - onedayclass_topic
-    - expected_domain
+    # - contest_participation
+    # - onedayclass_topic
+    # - expected_domain
   joiner: "\n"
   add_col_tags: true
   normalize_ws: true
   save_model: false   # save per-fold joblib when train.save_model && use_fold_ensemble
 
   tfidf:
-    analyzer: char
-    ngram_range: [3, 5]
+    analyzer: char  # char | char_wb
+    ngram_range: [3, 6]
     min_df: 2
     max_df: 0.95
     sublinear_tf: true
