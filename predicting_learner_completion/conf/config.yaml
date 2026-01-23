@@ -4,7 +4,6 @@ defaults:
   - data: data_default
   - model: lgbm
   - train: train_default
-  - optuna: optuna_default
   - wandb: wandb_default
 
 # Hydra output dir (runs are created under this folder)

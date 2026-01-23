@@ -766,7 +766,7 @@ def preprocess_fold_fit(
     반환:
       X_tr_p, X_va_p, test_p, cat_cols_p, meta
 
-    meta는 return_meta=True일 때만 풍부하게 채웁니다(Optuna 등 반복 호출 성능 고려).
+    meta는 return_meta=True일 때만 풍부하게 채웁니다(반복 호출 성능 고려).
     """
 
     X_tr = X_tr.copy()
@@ -1380,9 +1380,9 @@ def build_validation_error_reports(
         try:
             import wandb  # type: ignore
             small_cols = [c for c in [id_col, "fold", "y_true", "oof_proba", "pred", "error_type", "abs_margin"] if c in rich_err.columns]
-            wandb.log({
-                "val_errors/near_threshold": wandb.Table(dataframe=near[small_cols].head(min(len(near), 200))),
-                "val_errors/high_confidence": wandb.Table(dataframe=high_conf[small_cols].head(min(len(high_conf), 200))),
+            wandb.log({ # type: ignore
+                "val_errors/near_threshold": wandb.Table(dataframe=near[small_cols].head(min(len(near), 200))), # type: ignore
+                "val_errors/high_confidence": wandb.Table(dataframe=high_conf[small_cols].head(min(len(high_conf), 200))), # type: ignore
             })
         except Exception:
             pass
@@ -1598,328 +1598,8 @@ def _select(cfg, key: str, default=None):
         return default
 
 
-def run_optuna_tuning(
-    cfg: DictConfig,
-    X_raw: pd.DataFrame,
-    y: pd.Series,
-    run=None,
-) -> Dict[str, Any]:
-    """Tune LightGBM hyperparameters with Optuna (fold-fit preprocessing, leakage-free).
-
-    IMPORTANT:
-      - 각 fold의 전처리 기준(rare bucket/vocab/category map 등)은 train-fold에서만 생성합니다.
-      - 검증 fold는 해당 기준으로 transform만 수행합니다.
-
-    Metric:
-      - "auc" (default) : mean AUC over folds
-      - "f1"            : OOF F1 at best threshold (OOF 기반 threshold 탐색)
-    """
-    enable = bool(_select(cfg, "train.optuna.enable", False))
-    if not enable:
-        return {}
-
-    try:
-        import optuna # type: ignore
-    except ImportError as e:
-        raise ImportError("Optuna is not installed. Run: pip install optuna") from e
-
-    optuna_cfg = _select(cfg, "train.optuna", default={})
-    n_trials = int(getattr(optuna_cfg, "n_trials", 50))
-    timeout = getattr(optuna_cfg, "timeout", None)
-    timeout = int(timeout) if timeout is not None else None
-
-    metric = str(getattr(optuna_cfg, "metric", "auc")).lower()
-    if metric not in ("auc", "f1"):
-        raise ValueError(f"Unsupported optuna metric: {metric} (use 'auc' or 'f1')")
-
-    prune_metric = str(getattr(optuna_cfg, "prune_metric", "auc")).lower()
-    if prune_metric == "auto":
-        prune_metric = "auc" if metric == "f1" else metric
-    if prune_metric not in ("auc", "f1"):
-        raise ValueError(f"Unsupported optuna prune_metric: {prune_metric} (use 'auc'|'f1'|'auto')")
-
-    n_splits = int(getattr(optuna_cfg, "n_splits", int(cfg.train.n_splits)))
-
-    sampler_name = str(getattr(optuna_cfg, "sampler", "tpe")).lower()
-    seed = int(getattr(optuna_cfg, "seed", int(cfg.train.seed)))
-    if sampler_name == "random":
-        sampler = optuna.samplers.RandomSampler(seed=seed)
-    else:
-        sampler = optuna.samplers.TPESampler(seed=seed)
-
-    use_pruner = bool(getattr(optuna_cfg, "use_pruner", True))
-    pruner_cfg = getattr(optuna_cfg, "pruner", None)
-    pruner_name = str(getattr(pruner_cfg, "name", "median")).lower() if pruner_cfg is not None else "median"
-    n_warmup_steps = int(getattr(pruner_cfg, "n_warmup_steps", 10)) if pruner_cfg is not None else 10
-    if n_warmup_steps > n_splits:
-        n_warmup_steps = n_splits
-
-    if not use_pruner or pruner_name == "nop":
-        pruner = optuna.pruners.NopPruner()
-    elif pruner_name == "hyperband":
-        pruner = optuna.pruners.HyperbandPruner()
-    else:
-        pruner = optuna.pruners.MedianPruner(n_warmup_steps=n_warmup_steps)
-
-    study_name = str(getattr(optuna_cfg, "study_name", "lgbm_tuning"))
-    storage = getattr(optuna_cfg, "storage", None)  # e.g. "sqlite:///optuna.db"
-
-    study = optuna.create_study(
-        study_name=study_name,
-        direction="maximize",
-        sampler=sampler,
-        pruner=pruner,
-        storage=storage,
-        load_if_exists=True if storage else False,
-    )
-
-    base_params = dict(OmegaConf.to_container(cfg.model, resolve=True))
-    base_params["random_state"] = seed
-
-    # ---------------------------
-    # (옵션) Fold별 전처리 캐시: 전처리는 trial과 무관하므로 1회만 수행해 속도를 올릴 수 있음
-    # ---------------------------
-    cache_preprocess = bool(_select(cfg, "train.optuna.preprocess_cache", True))
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    fold_splits = list(skf.split(X_raw, y))
-
-    fold_cache: List[Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, List[str]]] = []
-    if cache_preprocess:
-        for tr_idx, va_idx in fold_splits:
-            X_tr_raw, y_tr = X_raw.iloc[tr_idx], y.iloc[tr_idx]
-            X_va_raw, y_va = X_raw.iloc[va_idx], y.iloc[va_idx]
-            X_tr, X_va, _, cat_cols, _ = preprocess_fold_fit(cfg, X_tr_raw, X_va_raw, None, return_meta=False)
-            fold_cache.append((X_tr, y_tr, X_va, y_va, cat_cols)) # type: ignore
-
-    def objective(trial: "optuna.Trial") -> float:
-        params = dict(base_params)
-
-        # Search spaces (from YAML if provided; otherwise fall back to safe defaults)
-        ss = getattr(optuna_cfg, "search_space", None)
-
-        def _ss_int(name: str, low: int, high: int, log: bool = False) -> int:
-            if ss is None or not hasattr(ss, name):
-                return int(trial.suggest_int(name, low, high, log=log))
-            cfg_item = getattr(ss, name)
-            _low = int(getattr(cfg_item, "low", low))
-            _high = int(getattr(cfg_item, "high", high))
-            _log = bool(getattr(cfg_item, "log", log))
-            return int(trial.suggest_int(name, _low, _high, log=_log))
-
-        def _ss_float(name: str, low: float, high: float, log: bool = False) -> float:
-            if ss is None or not hasattr(ss, name):
-                return float(trial.suggest_float(name, low, high, log=log))
-            cfg_item = getattr(ss, name)
-            _low = float(getattr(cfg_item, "low", low))
-            _high = float(getattr(cfg_item, "high", high))
-            _log = bool(getattr(cfg_item, "log", log))
-            return float(trial.suggest_float(name, _low, _high, log=_log))
-
-        def _ss_float_alias(primary: str, alias: str, low: float, high: float, log: bool = False) -> float:
-            if ss is not None and (not hasattr(ss, primary)) and hasattr(ss, alias):
-                cfg_item = getattr(ss, alias)
-                _low = float(getattr(cfg_item, "low", low))
-                _high = float(getattr(cfg_item, "high", high))
-                _log = bool(getattr(cfg_item, "log", log))
-                return float(trial.suggest_float(primary, _low, _high, log=_log))
-            return _ss_float(primary, low, high, log=log)
-
-        def _ss_cat(name: str, choices: List[Any]) -> Any:
-            if ss is None or not hasattr(ss, name):
-                return trial.suggest_categorical(name, choices)
-            cfg_item = getattr(ss, name)
-            _choices = list(getattr(cfg_item, "choices", choices))
-            if not _choices:
-                _choices = choices
-            return trial.suggest_categorical(name, _choices)
-
-        learning_rate = _ss_float("learning_rate", 0.01, 0.15, log=True)
-        max_depth = _ss_cat("max_depth", [-1, 4, 6, 8, 10, 12, 16])
-        num_leaves = _ss_int("num_leaves", 16, 256, log=True)
-        min_child_samples = _ss_int("min_child_samples", 5, 400, log=True)
-        min_split_gain = _ss_float("min_split_gain", 1e-8, 1.0, log=True)
-        reg_alpha = _ss_float("reg_alpha", 1e-8, 10.0, log=True)
-        reg_lambda = _ss_float("reg_lambda", 1e-3, 500.0, log=True)
-        subsample = _ss_float("subsample", 0.6, 1.0, log=False)
-        subsample_freq = _ss_cat("subsample_freq", [0, 1, 2, 5])
-        colsample_bytree = _ss_float_alias("colsample_bytree", "feature_fraction", 0.4, 1.0, log=False)
-        max_bin = _ss_cat("max_bin", [127, 255, 511])
-        scale_pos_weight = _ss_float("scale_pos_weight", 1.0, 4.0, log=True)
-
-        if int(max_depth) > 0:
-            max_leaves = int(2 ** int(max_depth))
-            num_leaves = int(min(int(num_leaves), max_leaves))
-
-        if float(subsample) >= 0.999:
-            subsample_freq = 0
-        else:
-            subsample_freq = int(max(1, int(subsample_freq)))
-
-        params.update({
-            "learning_rate": float(learning_rate),
-            "max_depth": int(max_depth),
-            "num_leaves": int(num_leaves),
-            "min_child_samples": int(min_child_samples),
-            "min_split_gain": float(min_split_gain),
-            "reg_alpha": float(reg_alpha),
-            "reg_lambda": float(reg_lambda),
-            "subsample": float(subsample),
-            "subsample_freq": int(subsample_freq),
-            "colsample_bytree": float(colsample_bytree),
-            "max_bin": int(max_bin),
-            "scale_pos_weight": float(scale_pos_weight),
-        })
-
-        aucs: List[float] = []
-        oof = np.zeros(len(X_raw), dtype=float)
-        seen_idx: List[int] = []
-
-        for fold, (tr_idx, va_idx) in enumerate(fold_splits, start=1):
-            if cache_preprocess:
-                X_tr, y_tr, X_va, y_va, cat_cols = fold_cache[fold - 1]
-            else:
-                X_tr_raw, y_tr = X_raw.iloc[tr_idx], y.iloc[tr_idx]
-                X_va_raw, y_va = X_raw.iloc[va_idx], y.iloc[va_idx]
-                X_tr, X_va, _, cat_cols, _ = preprocess_fold_fit(cfg, X_tr_raw, X_va_raw, None, return_meta=False)
-
-            model = lgb.LGBMClassifier(**params)
-            model.fit(
-                X_tr, y_tr,
-                eval_set=[(X_va, y_va)],
-                eval_metric="average_precision",
-                callbacks=[
-                    lgb.early_stopping(stopping_rounds=int(cfg.train.early_stopping_rounds), verbose=False),
-                ],
-                categorical_feature=cat_cols if len(cat_cols) > 0 else "auto",
-            )
-
-            proba_va = model.predict_proba(X_va, num_iteration=model.best_iteration_)[:, 1]
-            oof[va_idx] = proba_va
-            seen_idx.extend(list(va_idx))
-
-            auc = roc_auc_score(y_va, proba_va)
-            aucs.append(float(auc))
-
-            # ---- Pruning: report intermediate value per fold ----
-            if prune_metric == "auc":
-                intermediate = float(np.mean(aucs))
-            else:
-                try:
-                    y_part = y.values[seen_idx]
-                    p_part = oof[seen_idx]
-                    if bool(cfg.train.optimize_threshold.enable):
-                        _, f1_part = search_best_threshold(
-                            y_true=y_part,
-                            proba=p_part,
-                            method=str(_select(cfg, "train.optimize_threshold.method", "pr_curve")),
-                            min_t=float(cfg.train.optimize_threshold.clamp_min),
-                            max_t=float(cfg.train.optimize_threshold.clamp_max),
-                            grid_start=float(_select(cfg, "train.optimize_threshold.grid.start", _select(cfg, "train.optimize_threshold.grid_start", 0.05))),
-                            grid_end=float(_select(cfg, "train.optimize_threshold.grid.end", _select(cfg, "train.optimize_threshold.grid_end", 0.95))),
-                            grid_step=float(_select(cfg, "train.optimize_threshold.grid.step", _select(cfg, "train.optimize_threshold.grid_step", 0.01))),
-                        )
-                        intermediate = float(f1_part)
-                    else:
-                        thr = float(cfg.train.threshold)
-                        intermediate = float(f1_score(y_part, (p_part >= thr).astype(int)))
-                except Exception:
-                    intermediate = float("nan")
-
-            trial.report(intermediate, step=fold)
-            if use_pruner and trial.should_prune():
-                raise optuna.TrialPruned()
-
-        auc_mean = float(np.mean(aucs))
-        if metric == "auc":
-            return auc_mean
-
-        if bool(cfg.train.optimize_threshold.enable):
-            t, f1_best = search_best_threshold(
-                y_true=y.values,
-                proba=oof,
-                method=str(_select(cfg, "train.optimize_threshold.method", "pr_curve")),
-                min_t=float(cfg.train.optimize_threshold.clamp_min),
-                max_t=float(cfg.train.optimize_threshold.clamp_max),
-                grid_start=float(_select(cfg, "train.optimize_threshold.grid.start", _select(cfg, "train.optimize_threshold.grid_start", 0.05))),
-                grid_end=float(_select(cfg, "train.optimize_threshold.grid.end", _select(cfg, "train.optimize_threshold.grid_end", 0.95))),
-                grid_step=float(_select(cfg, "train.optimize_threshold.grid.step", _select(cfg, "train.optimize_threshold.grid_step", 0.01))),
-            )
-            trial.set_user_attr("best_threshold", float(t))
-            return float(f1_best)
-
-        thr = float(cfg.train.threshold)
-        trial.set_user_attr("best_threshold", float(thr))
-        return float(f1_score(y.values, (oof >= thr).astype(int)))
-
-    print(f"\n[Optuna] Start tuning: n_trials={n_trials} | metric={metric} | folds={n_splits} | foldfit_preprocess=True")
-    study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=True)
-
-    best = study.best_trial
-    best_params = dict(best.params)
-
-    overrides = {
-        "learning_rate": float(best_params["learning_rate"]),
-        "max_depth": int(best_params["max_depth"]),
-        "num_leaves": int(best_params["num_leaves"]),
-        "min_child_samples": int(best_params["min_child_samples"]),
-        "min_split_gain": float(best_params["min_split_gain"]),
-        "reg_alpha": float(best_params["reg_alpha"]),
-        "reg_lambda": float(best_params["reg_lambda"]),
-        "subsample": float(best_params["subsample"]),
-        "subsample_freq": int(best_params["subsample_freq"]),
-        "colsample_bytree": float(best_params["colsample_bytree"]),
-        "max_bin": int(best_params["max_bin"]),
-        "scale_pos_weight": float(best_params["scale_pos_weight"]),
-    }
-
-    best_threshold = None
-    try:
-        best_threshold = best.user_attrs.get("best_threshold", None)
-    except Exception:
-        best_threshold = None
-
-    best_payload = {
-        "optuna": {
-            "study_name": study.study_name,
-            "metric": str(metric),
-            "best_value": float(best.value),
-            "best_trial_number": int(best.number),
-            "best_threshold": float(best_threshold) if best_threshold is not None else None,
-            "raw_params": dict(best.params),
-            "model_overrides": dict(overrides),
-            "foldfit_preprocess": True,
-            "preprocess_cache": bool(cache_preprocess),
-        }
-    }
-    saved_path = save_yaml_in_output_dir("best_params.yaml", best_payload)
-    print(f"[Optuna] Saved best params -> {saved_path}")
-
-    print("\n[Optuna] Best trial")
-    print("  value:", best.value)
-    print("  params:", best.params)
-
-    if run is not None:
-        wandb_log(run, {
-            "optuna/best_value": float(best.value),
-            "optuna/best_learning_rate": overrides["learning_rate"],
-            "optuna/best_max_depth": overrides["max_depth"],
-            "optuna/best_num_leaves": overrides["num_leaves"],
-            "optuna/best_min_child_samples": overrides["min_child_samples"],
-            "optuna/best_min_split_gain": overrides["min_split_gain"],
-            "optuna/best_reg_alpha": overrides["reg_alpha"],
-            "optuna/best_reg_lambda": overrides["reg_lambda"],
-            "optuna/best_subsample": overrides["subsample"],
-            "optuna/best_subsample_freq": overrides["subsample_freq"],
-            "optuna/best_colsample_bytree": overrides["colsample_bytree"],
-            "optuna/best_feature_fraction": overrides["colsample_bytree"],
-            "optuna/best_max_bin": overrides["max_bin"],
-            "optuna/foldfit_preprocess": 1,
-        })
-
-    return overrides
-
-
-
+# Hyperparameter tuning is disabled in this version.
+# To tune, use Hydra multirun sweeps or an external search tool.
 
 
 def cv_train_foldfit(
@@ -2610,7 +2290,7 @@ def main(cfg: DictConfig) -> None:
     X = build_features(X)
     test = build_features(test)
 
-    # (누수 방지) CV/Optuna는 raw feature에서 fold-fit 전처리를 수행
+    # (누수 방지) CV는 raw feature에서 fold-fit 전처리를 수행
     X_raw = X.copy()
     test_raw = test.copy()
 
@@ -2761,7 +2441,7 @@ def main(cfg: DictConfig) -> None:
         print(f"[Warn] saving preprocess meta failed: {e}")
     # Dataset summary
     print(f"[Info] Train rows={len(train)} | Test rows={len(test_full)} | Features={X_full.shape[1]}")
-    print("[Info] CV/Optuna uses fold-fit preprocessing on raw features (leakage-free)")
+    print("[Info] CV uses fold-fit preprocessing on raw features (leakage-free)")
     print(f"[Info] Pos rate={y.mean():.4f} ({int(y.sum())}/{len(y)})")
     print(f"[Info] Dropped missing>{cfg.data.drop_missing_threshold}: {len(dropped_missing)} cols -> {dropped_missing}")
     if present_enable and present_cols_full:
@@ -2785,14 +2465,6 @@ def main(cfg: DictConfig) -> None:
         run.summary["data/multilabel_enabled"] = bool(multilabel_enabled)
         run.summary["data/multilabel_cols"] = int(len(list(_select(cfg, "data.multilabel.cols", [])) or [])) if bool(multilabel_enabled) else 0
 
-
-    # Optuna tuning (optional): updates cfg.model with best params before the main CV
-    optuna_overrides = run_optuna_tuning(cfg, X_raw, y, run)
-    if optuna_overrides:
-        for k, v in optuna_overrides.items():
-            cfg.model[k] = v
-        print(f"[Optuna] Applied best overrides to cfg.model: {optuna_overrides}")
-
     # CV (+ fold-ensemble prediction)
     use_fold_ensemble = bool(getattr(cfg.train, "use_fold_ensemble", True))
     save_fold_models = bool(cfg.train.save_model) and use_fold_ensemble
@@ -2813,201 +2485,281 @@ def main(cfg: DictConfig) -> None:
     print(f"F1(best-threshold) mean={f1_mean:.5f} ± {f1_std:.5f}")
     print(f"Use n_estimators={best_iter_final} (median best_iteration) for final fit")
 
-    # Optional: OOF-based threshold tuning
-    threshold = float(cfg.train.threshold)
-    best_f1 = float(f1_score(y.values, (oof_proba >= threshold).astype(int)))
-    if bool(cfg.train.optimize_threshold.enable):
-        t, f1_best = search_best_threshold(
+
+    # Save final model params for reproducibility (covers the effective params used for final fit)
+    try:
+        model_params_payload = dict(OmegaConf.to_container(cfg.model, resolve=True))
+        model_params_payload["n_estimators_final"] = int(best_iter_final)
+        save_yaml_in_output_dir("model_params.yaml", model_params_payload)
+    except Exception as e:
+        print(f"[Warn] saving model params failed: {e}")
+
+
+        # Optional: OOF-based threshold tuning
+        threshold = float(cfg.train.threshold)
+        best_f1 = float(f1_score(y.values, (oof_proba >= threshold).astype(int)))
+        if bool(cfg.train.optimize_threshold.enable):
+            t, f1_best = search_best_threshold(
+                    y_true=y.values,
+                    proba=oof_proba,
+                    method=str(_select(cfg, "train.optimize_threshold.method", "pr_curve")),
+                    min_t=float(cfg.train.optimize_threshold.clamp_min),
+                    max_t=float(cfg.train.optimize_threshold.clamp_max),
+                    grid_start=float(_select(cfg, "train.optimize_threshold.grid.start", _select(cfg, "train.optimize_threshold.grid_start", 0.05))),
+                    grid_end=float(_select(cfg, "train.optimize_threshold.grid.end", _select(cfg, "train.optimize_threshold.grid_end", 0.95))),
+                    grid_step=float(_select(cfg, "train.optimize_threshold.grid.step", _select(cfg, "train.optimize_threshold.grid_step", 0.01))),
+                )
+            threshold = t
+            best_f1 = f1_best
+            print(f"[OOF] Best threshold={threshold:.3f} | F1={best_f1:.5f}")
+
+        # Log aggregate metrics
+        wandb_log(run, {
+            "cv/auc_mean": auc_mean,
+            "cv/auc_std": auc_std,
+            "cv/f1_mean": f1_mean,
+            "cv/f1_std": f1_std,
+            "train/best_iter_final": best_iter_final,
+            "oof/best_threshold": threshold,
+            "oof/f1_at_best_threshold": best_f1,
+        })
+        # Persist run meta (threshold/metrics) for reproducibility (included in fold model bundle under meta/)
+        try:
+            threshold_payload = {
+                "threshold": float(threshold),
+                "best_f1": float(best_f1),
+                "auc_mean": float(auc_mean),
+                "auc_std": float(auc_std),
+                "cv_f1_mean_bestthr": float(f1_mean),
+                "cv_f1_std_bestthr": float(f1_std),
+                "best_iter_final": int(best_iter_final),
+                "threshold_mode": "optimized" if bool(cfg.train.optimize_threshold.enable) else "fixed",
+            }
+            # Include ensemble meta (weights, etc.) when available
+            if isinstance(ensemble_meta, dict) and int(ensemble_meta.get("enable", 0)) == 1:
+                threshold_payload["ensemble"] = ensemble_meta
+            save_yaml_in_output_dir("threshold.yaml", threshold_payload)
+        except Exception as e:
+            print(f"[Warn] saving threshold meta failed: {e}")
+
+
+
+        # -------------------------------
+        # Validation diagnostics (OOF)
+        # -------------------------------
+        # Save misclassified samples so you can audit what the model gets wrong during CV.
+        # Files are written under Hydra output_dir (e.g., outputs/YYYY-MM-DD/HH-MM-SS).
+        err_paths: Dict[str, Path] = {}
+        try:
+            err_paths = build_validation_error_reports(
+                cfg=cfg,
+                train_raw_df=train_raw_df,
                 y_true=y.values,
-                proba=oof_proba,
-                method=str(_select(cfg, "train.optimize_threshold.method", "pr_curve")),
-                min_t=float(cfg.train.optimize_threshold.clamp_min),
-                max_t=float(cfg.train.optimize_threshold.clamp_max),
-                grid_start=float(_select(cfg, "train.optimize_threshold.grid.start", _select(cfg, "train.optimize_threshold.grid_start", 0.05))),
-                grid_end=float(_select(cfg, "train.optimize_threshold.grid.end", _select(cfg, "train.optimize_threshold.grid_end", 0.95))),
-                grid_step=float(_select(cfg, "train.optimize_threshold.grid.step", _select(cfg, "train.optimize_threshold.grid_step", 0.01))),
+                oof_proba=oof_proba,
+                threshold=threshold,
+                run=run,
+                oof_parts=oof_parts if isinstance(oof_parts, dict) else None,
             )
-        threshold = t
-        best_f1 = f1_best
-        print(f"[OOF] Best threshold={threshold:.3f} | F1={best_f1:.5f}")
-
-    # Log aggregate metrics
-    wandb_log(run, {
-        "cv/auc_mean": auc_mean,
-        "cv/auc_std": auc_std,
-        "cv/f1_mean": f1_mean,
-        "cv/f1_std": f1_std,
-        "train/best_iter_final": best_iter_final,
-        "oof/best_threshold": threshold,
-        "oof/f1_at_best_threshold": best_f1,
-    })
-    # Persist run meta (threshold/metrics) for reproducibility (included in fold model bundle under meta/)
-    try:
-        threshold_payload = {
-            "threshold": float(threshold),
-            "best_f1": float(best_f1),
-            "auc_mean": float(auc_mean),
-            "auc_std": float(auc_std),
-            "cv_f1_mean_bestthr": float(f1_mean),
-            "cv_f1_std_bestthr": float(f1_std),
-            "best_iter_final": int(best_iter_final),
-            "threshold_mode": "optimized" if bool(cfg.train.optimize_threshold.enable) else "fixed",
-        }
-        # Include ensemble meta (weights, etc.) when available
-        if isinstance(ensemble_meta, dict) and int(ensemble_meta.get("enable", 0)) == 1:
-            threshold_payload["ensemble"] = ensemble_meta
-        save_yaml_in_output_dir("threshold.yaml", threshold_payload)
-    except Exception as e:
-        print(f"[Warn] saving threshold meta failed: {e}")
+            # Optionally log key diagnostics as artifacts (keep it small)
+            if run is not None and bool(getattr(cfg.wandb, "log_artifacts", False)) and err_paths:
+                for k in ["val_predictions", "val_errors_all", "val_error_slices", "val_errors_per_fold_zip"]:
+                    p = err_paths.get(k)
+                    if p is not None and Path(p).exists():
+                        wandb_log_artifact(run, Path(p), name=make_wandb_artifact_name(cfg, run, k), art_type="dataset")
+        except Exception as e:
+            print(f"[Warn] validation error reporting failed: {e}")
 
 
 
-    # -------------------------------
-    # Validation diagnostics (OOF)
-    # -------------------------------
-    # Save misclassified samples so you can audit what the model gets wrong during CV.
-    # Files are written under Hydra output_dir (e.g., outputs/YYYY-MM-DD/HH-MM-SS).
-    err_paths: Dict[str, Path] = {}
-    try:
-        err_paths = build_validation_error_reports(
-            cfg=cfg,
-            train_raw_df=train_raw_df,
-            y_true=y.values,
-            oof_proba=oof_proba,
-            threshold=threshold,
-            run=run,
-            oof_parts=oof_parts if isinstance(oof_parts, dict) else None,
-        )
-        # Optionally log key diagnostics as artifacts (keep it small)
-        if run is not None and bool(getattr(cfg.wandb, "log_artifacts", False)) and err_paths:
-            for k in ["val_predictions", "val_errors_all", "val_error_slices", "val_errors_per_fold_zip"]:
-                p = err_paths.get(k)
-                if p is not None and Path(p).exists():
-                    wandb_log_artifact(run, Path(p), name=make_wandb_artifact_name(cfg, run, k), art_type="dataset")
-    except Exception as e:
-        print(f"[Warn] validation error reporting failed: {e}")
+        # Save OOF
+        oof_path = Path(cfg.train.oof_path)
+        oof_df: Dict[str, Any] = {"oof_proba": oof_proba, "y_true": y.values}
+        # Also save per-model OOF components for easy ensembling/debugging
+        if isinstance(oof_parts, dict):
+            for k, v in oof_parts.items():
+                try:
+                    oof_df[f"oof_{k}"] = np.asarray(v)
+                except Exception:
+                    pass
+        pd.DataFrame(oof_df).to_csv(oof_path, index=False)
+        print("Saved OOF:", oof_path)
+        if run is not None and bool(cfg.wandb.log_artifacts):
+            wandb_log_artifact(run, oof_path, name=make_wandb_artifact_name(cfg, run, "oof_proba"), art_type="dataset")
 
-
-
-    # Save OOF
-    oof_path = Path(cfg.train.oof_path)
-    oof_df: Dict[str, Any] = {"oof_proba": oof_proba, "y_true": y.values}
-    # Also save per-model OOF components for easy ensembling/debugging
-    if isinstance(oof_parts, dict):
-        for k, v in oof_parts.items():
-            try:
-                oof_df[f"oof_{k}"] = np.asarray(v)
-            except Exception:
-                pass
-    pd.DataFrame(oof_df).to_csv(oof_path, index=False)
-    print("Saved OOF:", oof_path)
-    if run is not None and bool(cfg.wandb.log_artifacts):
-        wandb_log_artifact(run, oof_path, name=make_wandb_artifact_name(cfg, run, "oof_proba"), art_type="dataset")
-
-    # Predict
-    if use_fold_ensemble:
-        test_proba = test_proba_cv
-        final_model = None
-        print(f"[Predict] Using fold-ensemble proba (mean over {cfg.train.n_splits} folds)")
-    else:
-        final_model, test_proba = fit_final_and_predict(cfg, X_full, y, test_full, cat_cols_full, best_iter_final)
-        print("[Predict] Using single final model fit on full data")
-
-    test_pred = (test_proba >= threshold).astype(int)
-
-    # Submission
-    out_path = Path(cfg.train.out_path)
-    if sample_submission_path.exists():
-        sub = pd.read_csv(sample_submission_path)
-        if cfg.data.target_col not in sub.columns:
-            # sample_submission에 타깃 컬럼이 없으면 추가
-            sub[cfg.data.target_col] = test_pred
-        else:
-            sub[cfg.data.target_col] = test_pred
-        sub.to_csv(out_path, index=False)
-    else:
-        sub = pd.DataFrame({cfg.data.target_col: test_pred})
-        sub.to_csv(out_path, index=False)
-
-    print("Saved submission:", out_path)
-
-    # Probabilities
-    if cfg.train.out_proba_path:
-        proba_path = Path(cfg.train.out_proba_path)
-        pd.DataFrame({f"{cfg.data.target_col}_proba": test_proba}).to_csv(proba_path, index=False)
-        print("Saved proba:", proba_path)
-
-    manifest_path: Optional[Path] = None
-    fold_bundle_path: Optional[Path] = None
-    model_bundle_path: Optional[Path] = None
-
-    # Save model
-    if bool(cfg.train.save_model):
-        model_path = Path(cfg.train.model_path)
-
+        # Predict
         if use_fold_ensemble:
-            # fold 모델은 cv_train에서 이미 저장됨(save_fold_models=True일 때)
-            manifest_path = model_path.with_name(f"{model_path.stem}_folds_manifest.txt")
-            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            test_proba = test_proba_cv
+            final_model = None
+            print(f"[Predict] Using fold-ensemble proba (mean over {cfg.train.n_splits} folds)")
+        else:
+            final_model, test_proba = fit_final_and_predict(cfg, X_full, y, test_full, cat_cols_full, best_iter_final)
+            print("[Predict] Using single final model fit on full data")
 
-            with open(manifest_path, "w", encoding="utf-8") as f:
-                f.write(f"use_fold_ensemble: {use_fold_ensemble}\n")
-                f.write(f"n_folds: {int(cfg.train.n_splits)}\n")
-                f.write(f"threshold: {float(threshold)}\n")
-                f.write("fold_model_paths:\n")
-                for fp in fold_model_paths:
-                    f.write(f"  - {str(fp)}\n")
+        test_pred = (test_proba >= threshold).astype(int)
 
-            print("Saved fold model manifest:", manifest_path)
-            if not fold_model_paths:
-                print("[Warn] fold_model_paths is empty (check save_fold_models / model_path).")
+        # Submission
+        out_path = Path(cfg.train.out_path)
+        if sample_submission_path.exists():
+            sub = pd.read_csv(sample_submission_path)
+            if cfg.data.target_col not in sub.columns:
+                # sample_submission에 타깃 컬럼이 없으면 추가
+                sub[cfg.data.target_col] = test_pred
+            else:
+                sub[cfg.data.target_col] = test_pred
+            sub.to_csv(out_path, index=False)
+        else:
+            sub = pd.DataFrame({cfg.data.target_col: test_pred})
+            sub.to_csv(out_path, index=False)
 
-            # Bundle manifest + fold models into a single zip (for a single W&B artifact)
-            try:
-                import zipfile
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                fold_bundle_path = make_repro_bundle_path(model_path, cfg, run, kind="fold", ts=ts)
-                with zipfile.ZipFile(fold_bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                    if manifest_path.exists():
-                        zf.write(manifest_path, arcname=f"fold_models/{manifest_path.name}")
+        print("Saved submission:", out_path)
+
+        # Probabilities
+        if cfg.train.out_proba_path:
+            proba_path = Path(cfg.train.out_proba_path)
+            pd.DataFrame({f"{cfg.data.target_col}_proba": test_proba}).to_csv(proba_path, index=False)
+            print("Saved proba:", proba_path)
+
+        manifest_path: Optional[Path] = None
+        fold_bundle_path: Optional[Path] = None
+        model_bundle_path: Optional[Path] = None
+
+        # Save model
+        if bool(cfg.train.save_model):
+            model_path = Path(cfg.train.model_path)
+
+            if use_fold_ensemble:
+                # fold 모델은 cv_train에서 이미 저장됨(save_fold_models=True일 때)
+                manifest_path = model_path.with_name(f"{model_path.stem}_folds_manifest.txt")
+                manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+                with open(manifest_path, "w", encoding="utf-8") as f:
+                    f.write(f"use_fold_ensemble: {use_fold_ensemble}\n")
+                    f.write(f"n_folds: {int(cfg.train.n_splits)}\n")
+                    f.write(f"threshold: {float(threshold)}\n")
+                    f.write("fold_model_paths:\n")
                     for fp in fold_model_paths:
-                        fp = Path(fp)
-                        if fp.exists():
-                            zf.write(fp, arcname=f"fold_models/{fp.name}")
-                    # Add meta files (config/best_params/threshold etc.) under meta/
-                    try:
-                        try:
-                            output_dir = Path(HydraConfig.get().runtime.output_dir)
-                        except Exception:
-                            output_dir = Path.cwd()
+                        f.write(f"  - {str(fp)}\n")
 
-                        meta_candidates = [
-                            output_dir / "config_resolved.yaml",
-                            output_dir / "best_params.yaml",
-                            output_dir / "threshold.yaml",
-                            output_dir / "feature_columns.json",
-                            output_dir / "preprocess_meta.yaml",
-                            output_dir / "run_info.yaml",
-                            output_dir / "val_predictions.csv",
-                            output_dir / "val_errors_all.csv",
-                            output_dir / "val_errors_near_threshold.csv",
-                            output_dir / "val_errors_high_confidence.csv",
-                            output_dir / "val_fold_summary.csv",
-                            output_dir / "val_error_slices.csv",
-                            output_dir / "val_errors_per_fold.zip",
-                        ]
-                        for mp in meta_candidates:
-                            if mp.exists() and mp.is_file():
-                                zf.write(mp, arcname=f"meta/{mp.name}")
-                        # Add fold-specific preprocessing meta (if exists)
+                print("Saved fold model manifest:", manifest_path)
+                if not fold_model_paths:
+                    print("[Warn] fold_model_paths is empty (check save_fold_models / model_path).")
+
+                # Bundle manifest + fold models into a single zip (for a single W&B artifact)
+                try:
+                    import zipfile
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    fold_bundle_path = make_repro_bundle_path(model_path, cfg, run, kind="fold", ts=ts)
+                    with zipfile.ZipFile(fold_bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                        if manifest_path.exists():
+                            zf.write(manifest_path, arcname=f"fold_models/{manifest_path.name}")
+                        for fp in fold_model_paths:
+                            fp = Path(fp)
+                            if fp.exists():
+                                zf.write(fp, arcname=f"fold_models/{fp.name}")
+                        # Add meta files (config/best_params/threshold etc.) under meta/
                         try:
-                            for mp in output_dir.glob("fold*_preprocess_meta.yaml"):
+                            try:
+                                output_dir = Path(HydraConfig.get().runtime.output_dir)
+                            except Exception:
+                                output_dir = Path.cwd()
+
+                            meta_candidates = [
+                                output_dir / "config_resolved.yaml",
+                                output_dir / "model_params.yaml",
+                                output_dir / "threshold.yaml",
+                                output_dir / "feature_columns.json",
+                                output_dir / "preprocess_meta.yaml",
+                                output_dir / "run_info.yaml",
+                                output_dir / "val_predictions.csv",
+                                output_dir / "val_errors_all.csv",
+                                output_dir / "val_errors_near_threshold.csv",
+                                output_dir / "val_errors_high_confidence.csv",
+                                output_dir / "val_fold_summary.csv",
+                                output_dir / "val_error_slices.csv",
+                                output_dir / "val_errors_per_fold.zip",
+                            ]
+                            for mp in meta_candidates:
                                 if mp.exists() and mp.is_file():
                                     zf.write(mp, arcname=f"meta/{mp.name}")
-                        except Exception as e:
-                            print(f"[Warn] adding fold preprocess meta files failed: {e}")
+                            # Add fold-specific preprocessing meta (if exists)
+                            try:
+                                for mp in output_dir.glob("fold*_preprocess_meta.yaml"):
+                                    if mp.exists() and mp.is_file():
+                                        zf.write(mp, arcname=f"meta/{mp.name}")
+                            except Exception as e:
+                                print(f"[Warn] adding fold preprocess meta files failed: {e}")
 
-                        # Add outputs for one-shot reproducibility
+                            # Add outputs for one-shot reproducibility
+                            try:
+                                if out_path.exists():
+                                    zf.write(out_path, arcname="outputs/submission.csv")
+                                if "proba_path" in locals() and (proba_path is not None) and Path(proba_path).exists():
+                                    zf.write(Path(proba_path), arcname="outputs/submission_proba.csv")
+                                if oof_path.exists():
+                                    zf.write(oof_path, arcname="outputs/oof.csv")
+                            except Exception as e:
+                                print(f"[Warn] adding outputs to bundle failed: {e}")
+                        except Exception as e:
+                            print(f"[Warn] adding meta files to bundle failed: {e}")
+                    print("Saved fold model bundle:", fold_bundle_path)
+                except Exception as e:
+                    print(f"[Warn] fold model bundling failed: {e}")
+                    fold_bundle_path = None
+
+
+            else:
+                booster = final_model.booster_ # type: ignore
+                model_path.parent.mkdir(parents=True, exist_ok=True)
+                booster.save_model(str(model_path))
+                print("Saved model:", model_path)
+
+                # Bundle final model + meta + outputs into a single zip for full reproducibility
+                try:
+                    import zipfile
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    model_bundle_path = make_repro_bundle_path(model_path, cfg, run, kind="single", ts=ts)
+
+                    with zipfile.ZipFile(model_bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                        # Model
+                        if model_path.exists():
+                            zf.write(model_path, arcname=f"model/{model_path.name}")
+
+                        # Meta
+                        try:
+                            try:
+                                output_dir = Path(HydraConfig.get().runtime.output_dir)
+                            except Exception:
+                                output_dir = Path.cwd()
+
+                            meta_candidates = [
+                                output_dir / "config_resolved.yaml",
+                                output_dir / "model_params.yaml",
+                                output_dir / "threshold.yaml",
+                                output_dir / "feature_columns.json",
+                                output_dir / "preprocess_meta.yaml",
+                                output_dir / "run_info.yaml",
+                                output_dir / "val_predictions.csv",
+                                output_dir / "val_errors_all.csv",
+                                output_dir / "val_errors_near_threshold.csv",
+                                output_dir / "val_errors_high_confidence.csv",
+                                output_dir / "val_fold_summary.csv",
+                                output_dir / "val_error_slices.csv",
+                                output_dir / "val_errors_per_fold.zip",
+                            ]
+                            for mp in meta_candidates:
+                                if mp.exists() and mp.is_file():
+                                    zf.write(mp, arcname=f"meta/{mp.name}")
+                            # Add fold-specific preprocessing meta (if exists)
+                            try:
+                                for mp in output_dir.glob("fold*_preprocess_meta.yaml"):
+                                    if mp.exists() and mp.is_file():
+                                        zf.write(mp, arcname=f"meta/{mp.name}")
+                            except Exception as e:
+                                print(f"[Warn] adding fold preprocess meta files failed: {e}")
+                        except Exception as e:
+                            print(f"[Warn] adding meta files to model bundle failed: {e}")
+
+                        # Outputs
                         try:
                             if out_path.exists():
                                 zf.write(out_path, arcname="outputs/submission.csv")
@@ -3016,128 +2768,58 @@ def main(cfg: DictConfig) -> None:
                             if oof_path.exists():
                                 zf.write(oof_path, arcname="outputs/oof.csv")
                         except Exception as e:
-                            print(f"[Warn] adding outputs to bundle failed: {e}")
-                    except Exception as e:
-                        print(f"[Warn] adding meta files to bundle failed: {e}")
-                print("Saved fold model bundle:", fold_bundle_path)
-            except Exception as e:
-                print(f"[Warn] fold model bundling failed: {e}")
-                fold_bundle_path = None
+                            print(f"[Warn] adding outputs to model bundle failed: {e}")
 
+                    print("Saved model bundle:", model_bundle_path)
+                except Exception as e:
+                    print(f"[Warn] model bundling failed: {e}")
+                    model_bundle_path = None
 
-        else:
-            booster = final_model.booster_ # type: ignore
-            model_path.parent.mkdir(parents=True, exist_ok=True)
-            booster.save_model(str(model_path))
-            print("Saved model:", model_path)
-
-            # Bundle final model + meta + outputs into a single zip for full reproducibility
-            try:
-                import zipfile
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                model_bundle_path = make_repro_bundle_path(model_path, cfg, run, kind="single", ts=ts)
-
-                with zipfile.ZipFile(model_bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                    # Model
-                    if model_path.exists():
-                        zf.write(model_path, arcname=f"model/{model_path.name}")
-
-                    # Meta
-                    try:
-                        try:
-                            output_dir = Path(HydraConfig.get().runtime.output_dir)
-                        except Exception:
-                            output_dir = Path.cwd()
-
-                        meta_candidates = [
-                            output_dir / "config_resolved.yaml",
-                            output_dir / "best_params.yaml",
-                            output_dir / "threshold.yaml",
-                            output_dir / "feature_columns.json",
-                            output_dir / "preprocess_meta.yaml",
-                            output_dir / "run_info.yaml",
-                            output_dir / "val_predictions.csv",
-                            output_dir / "val_errors_all.csv",
-                            output_dir / "val_errors_near_threshold.csv",
-                            output_dir / "val_errors_high_confidence.csv",
-                            output_dir / "val_fold_summary.csv",
-                            output_dir / "val_error_slices.csv",
-                            output_dir / "val_errors_per_fold.zip",
-                        ]
-                        for mp in meta_candidates:
-                            if mp.exists() and mp.is_file():
-                                zf.write(mp, arcname=f"meta/{mp.name}")
-                        # Add fold-specific preprocessing meta (if exists)
-                        try:
-                            for mp in output_dir.glob("fold*_preprocess_meta.yaml"):
-                                if mp.exists() and mp.is_file():
-                                    zf.write(mp, arcname=f"meta/{mp.name}")
-                        except Exception as e:
-                            print(f"[Warn] adding fold preprocess meta files failed: {e}")
-                    except Exception as e:
-                        print(f"[Warn] adding meta files to model bundle failed: {e}")
-
-                    # Outputs
-                    try:
-                        if out_path.exists():
-                            zf.write(out_path, arcname="outputs/submission.csv")
-                        if "proba_path" in locals() and (proba_path is not None) and Path(proba_path).exists():
-                            zf.write(Path(proba_path), arcname="outputs/submission_proba.csv")
-                        if oof_path.exists():
-                            zf.write(oof_path, arcname="outputs/oof.csv")
-                    except Exception as e:
-                        print(f"[Warn] adding outputs to model bundle failed: {e}")
-
-                print("Saved model bundle:", model_bundle_path)
-            except Exception as e:
-                print(f"[Warn] model bundling failed: {e}")
-                model_bundle_path = None
-
-    # W&B artifacts + feature importance
-    if run is not None:
-        if bool(cfg.wandb.log_feature_importance):
-            if use_fold_ensemble:
-                importances = cv_feat_imp
-            else:
-                importances = final_model.feature_importances_ # type: ignore
-
-            fi = pd.DataFrame({
-                "feature": X_full.columns,
-                "importance": importances,
-            }).sort_values("importance", ascending=False)
-            try:
-                import wandb # type: ignore
-                table = wandb.Table(dataframe=fi.head(200)) # type: ignore
-                wandb.log({"feature_importance_top200": table}) # type: ignore
-            except Exception as e:
-                print(f"[Warn] feature importance logging failed: {e}")
-
-        if bool(cfg.wandb.log_artifacts):
-            if out_path.exists():
-                wandb_log_artifact(run, out_path, name=make_wandb_artifact_name(cfg, run, "submission"), art_type="output")
-            if cfg.train.out_proba_path and Path(cfg.train.out_proba_path).exists():
-                wandb_log_artifact(run, Path(cfg.train.out_proba_path), name=make_wandb_artifact_name(cfg, run, "submission_proba"), art_type="output")
-
-            # Model artifacts
-            if bool(cfg.train.save_model):
+        # W&B artifacts + feature importance
+        if run is not None:
+            if bool(cfg.wandb.log_feature_importance):
                 if use_fold_ensemble:
-                    if fold_bundle_path is not None and fold_bundle_path.exists():
-                        wandb_log_artifact(run, fold_bundle_path, name=make_wandb_artifact_name(cfg, run, "repro_bundle_fold"), art_type="model")
-                    elif manifest_path is not None and manifest_path.exists():
-                        wandb_log_artifact(run, manifest_path, name=make_wandb_artifact_name(cfg, run, "fold_model_manifest"), art_type="model")
+                    importances = cv_feat_imp
                 else:
-                    model_path = Path(cfg.train.model_path)
-                    if model_bundle_path is not None and Path(model_bundle_path).exists():
-                        wandb_log_artifact(
-                            run,
-                            Path(model_bundle_path),
-                            name=make_wandb_artifact_name(cfg, run, "repro_bundle_single"),
-                            art_type="model",
-                        )
-                    elif model_path.exists():
-                        wandb_log_artifact(run, model_path, name=make_wandb_artifact_name(cfg, run, "final_model"), art_type="model")
+                    importances = final_model.feature_importances_ # type: ignore
 
-        run.finish()
+                fi = pd.DataFrame({
+                    "feature": X_full.columns,
+                    "importance": importances,
+                }).sort_values("importance", ascending=False)
+                try:
+                    import wandb # type: ignore
+                    table = wandb.Table(dataframe=fi.head(200)) # type: ignore
+                    wandb.log({"feature_importance_top200": table}) # type: ignore
+                except Exception as e:
+                    print(f"[Warn] feature importance logging failed: {e}")
+
+            if bool(cfg.wandb.log_artifacts):
+                if out_path.exists():
+                    wandb_log_artifact(run, out_path, name=make_wandb_artifact_name(cfg, run, "submission"), art_type="output")
+                if cfg.train.out_proba_path and Path(cfg.train.out_proba_path).exists():
+                    wandb_log_artifact(run, Path(cfg.train.out_proba_path), name=make_wandb_artifact_name(cfg, run, "submission_proba"), art_type="output")
+
+                # Model artifacts
+                if bool(cfg.train.save_model):
+                    if use_fold_ensemble:
+                        if fold_bundle_path is not None and fold_bundle_path.exists():
+                            wandb_log_artifact(run, fold_bundle_path, name=make_wandb_artifact_name(cfg, run, "repro_bundle_fold"), art_type="model")
+                        elif manifest_path is not None and manifest_path.exists():
+                            wandb_log_artifact(run, manifest_path, name=make_wandb_artifact_name(cfg, run, "fold_model_manifest"), art_type="model")
+                    else:
+                        model_path = Path(cfg.train.model_path)
+                        if model_bundle_path is not None and Path(model_bundle_path).exists():
+                            wandb_log_artifact(
+                                run,
+                                Path(model_bundle_path),
+                                name=make_wandb_artifact_name(cfg, run, "repro_bundle_single"),
+                                art_type="model",
+                            )
+                        elif model_path.exists():
+                            wandb_log_artifact(run, model_path, name=make_wandb_artifact_name(cfg, run, "final_model"), art_type="model")
+
+            run.finish()
 
 
 if __name__ == "__main__":
