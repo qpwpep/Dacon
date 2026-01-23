@@ -53,12 +53,12 @@ multilabel:
     - expected_domain
     - desired_certificate
     - onedayclass_topic
-    - previous_class_3
-    - previous_class_4
-    - previous_class_5
-    - previous_class_6
-    - previous_class_7
-    - previous_class_8
+    # - previous_class_3
+    # - previous_class_4
+    # - previous_class_5
+    # - previous_class_6
+    # - previous_class_7
+    # - previous_class_8
   sep: ","
   min_freq: 2     # keep tokens that appear >= min_freq in TRAIN
   top_k: 120       # keep only the most frequent top_k tokens per column (set null for no limit)

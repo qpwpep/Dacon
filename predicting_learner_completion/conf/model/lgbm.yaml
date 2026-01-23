@@ -3,10 +3,10 @@
 objective: binary
 learning_rate: 0.02
 n_estimators: 5000        # used for early-stopping; final n_estimators will be set to median(best_iteration)
-num_leaves: 31
-max_depth: 6
-min_child_samples: 80
-min_split_gain: 0.02
+num_leaves: 63
+max_depth: -1
+min_child_samples: 30
+min_split_gain: 0.0
 
 subsample: 0.8
 subsample_freq: 1
