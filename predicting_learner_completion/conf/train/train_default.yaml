@@ -131,3 +131,7 @@ debug:
       topk_per_col: 10
     # If wandb.enable=true, log small tables (near/high_conf) as W&B Tables
     log_to_wandb: true
+    attach_foldfit_inputs: true
+    dump_fold_preprocess_meta: true
+    max_tokens_per_multilabel_col: 30
+    max_nonzero_features: 80
