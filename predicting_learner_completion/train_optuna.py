@@ -1052,6 +1052,347 @@ def save_json_in_output_dir(filename: str, obj: Any) -> Path:
     return out_path
 
 
+def save_csv_in_output_dir(filename: str, df: pd.DataFrame, index: bool = False) -> Path:
+    """Save CSV under Hydra output_dir (or cwd fallback)."""
+    try:
+        output_dir = Path(HydraConfig.get().runtime.output_dir)
+    except Exception:
+        output_dir = Path.cwd()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / filename
+    df.to_csv(out_path, index=index, encoding="utf-8-sig")
+    return out_path
+
+
+def compute_stratified_fold_ids(y: pd.Series, n_splits: int, seed: int) -> np.ndarray:
+    """Reconstruct fold assignment used by StratifiedKFold in cv_train_foldfit.
+
+    Returns:
+        fold_id array of shape (len(y),) with values in [1..n_splits].
+    """
+    y_arr = np.asarray(y).astype(int)
+    skf = StratifiedKFold(n_splits=int(n_splits), shuffle=True, random_state=int(seed))
+    fold_id = np.full(len(y_arr), -1, dtype=int)
+    for fold, (_, va_idx) in enumerate(skf.split(np.zeros(len(y_arr)), y_arr), start=1):
+        fold_id[va_idx] = int(fold)
+    return fold_id
+
+
+def _safe_cols(df: pd.DataFrame, cols: List[str]) -> List[str]:
+    return [c for c in cols if c in df.columns]
+
+
+def build_validation_error_reports(
+    cfg: DictConfig,
+    train_raw_df: pd.DataFrame,
+    y_true: np.ndarray,
+    oof_proba: np.ndarray,
+    threshold: float,
+    run=None,
+    oof_parts: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Path]:
+    """Generate human-auditable validation diagnostics for misclassified OOF samples.
+
+    Produces (under Hydra output_dir):
+      - val_predictions.csv: compact per-row summary (fold/y/proba/pred/error_type)
+      - val_errors_all.csv: all misclassified rows + raw+engineered features
+      - val_errors_near_threshold.csv: hardest mistakes near threshold
+      - val_errors_high_confidence.csv: most confident mistakes (far from threshold)
+      - val_fold_summary.csv: per-fold confusion/metrics summary
+      - (optional) val_errors_per_fold.zip: fold-wise misclassified CSVs
+
+    Returns:
+      dict of {name: path}
+    """
+    enable = bool(_select(cfg, "train.debug.misclassified.enable", True))
+    if not enable:
+        return {}
+
+    # Controls
+    per_fold = bool(_select(cfg, "train.debug.misclassified.per_fold", True))
+    max_rows_total = int(_select(cfg, "train.debug.misclassified.max_rows_total", 5000))
+    max_rows_per_fold = int(_select(cfg, "train.debug.misclassified.max_rows_per_fold", 2000))
+    topk_near = int(_select(cfg, "train.debug.misclassified.topk_near_threshold", 200))
+    topk_conf = int(_select(cfg, "train.debug.misclassified.topk_high_confidence", 200))
+    log_to_wandb = bool(_select(cfg, "train.debug.misclassified.log_to_wandb", True))
+
+    id_col = str(_select(cfg, "data.id_col", "ID"))
+    target_col = str(_select(cfg, "data.target_col", "target"))
+
+    y_true = np.asarray(y_true).astype(int)
+    oof_proba = np.asarray(oof_proba).astype(float)
+
+    if len(y_true) != len(oof_proba):
+        raise ValueError(f"len(y_true) != len(oof_proba): {len(y_true)} vs {len(oof_proba)}")
+
+    # Fold assignment (to help you spot fold-specific failure modes)
+    fold_id = compute_stratified_fold_ids(
+        y=pd.Series(y_true),
+        n_splits=int(_select(cfg, "train.n_splits", 5)),
+        seed=int(_select(cfg, "train.seed", 42)),
+    )
+
+    pred = (oof_proba >= float(threshold)).astype(int)
+    is_err = (pred != y_true)
+    err_type = np.where((y_true == 0) & (pred == 1), "FP",
+                np.where((y_true == 1) & (pred == 0), "FN", "OK"))
+    margin = oof_proba - float(threshold)
+    abs_margin = np.abs(margin)
+
+    # 1) Compact per-row prediction summary (easy to filter)
+    pred_df = pd.DataFrame({
+        **({id_col: train_raw_df[id_col].values} if id_col in train_raw_df.columns else {}),
+        "row_index": np.arange(len(y_true), dtype=int),
+        "fold": fold_id.astype(int),
+        "y_true": y_true.astype(int),
+        "oof_proba": oof_proba.astype(float),
+        "pred": pred.astype(int),
+        "error_type": err_type.astype(str),
+        "margin": margin.astype(float),
+        "abs_margin": abs_margin.astype(float),
+    })
+
+    # Add per-model components when available (useful for ensemble debugging)
+    if isinstance(oof_parts, dict):
+        for k, v in oof_parts.items():
+            try:
+                vv = np.asarray(v).astype(float)
+                if vv.shape[0] == len(y_true):
+                    pred_df[f"oof_{k}"] = vv
+            except Exception:
+                continue
+
+    # Sort: errors first, then hardest near threshold
+    pred_df = pred_df.sort_values(by=["error_type", "abs_margin"], ascending=[True, True])
+
+    paths: Dict[str, Path] = {}
+    paths["val_predictions"] = save_csv_in_output_dir("val_predictions.csv", pred_df, index=False)
+
+    # 2) Rich error table with raw + engineered features
+    # Build engineered features in the same way as training (drop id/target first)
+    raw_features = train_raw_df.copy()
+    if target_col in raw_features.columns:
+        raw_features = raw_features.drop(columns=[target_col])
+    if id_col in raw_features.columns:
+        raw_features_wo_id = raw_features.drop(columns=[id_col])
+    else:
+        raw_features_wo_id = raw_features
+
+    raw_prefixed = raw_features_wo_id.add_prefix("raw__")
+
+    # Engineer features (keep a separate copy so raw columns are preserved)
+    engineered = build_features(raw_features_wo_id.copy())
+
+    rich = pd.concat(
+        [
+            train_raw_df[_safe_cols(train_raw_df, [id_col])].reset_index(drop=True),
+            pd.Series(y_true, name="y_true"),
+            pd.Series(oof_proba, name="oof_proba"),
+            pd.Series(pred, name="pred"),
+            pd.Series(err_type, name="error_type"),
+            pd.Series(fold_id, name="fold"),
+            pd.Series(margin, name="margin"),
+            pd.Series(abs_margin, name="abs_margin"),
+            raw_prefixed.reset_index(drop=True),
+            engineered.reset_index(drop=True),
+        ],
+        axis=1,
+    )
+
+    # Attach per-model components (ensemble debugging)
+    if isinstance(oof_parts, dict):
+        for k, v in oof_parts.items():
+            try:
+                vv = np.asarray(v).astype(float)
+                if vv.shape[0] == len(y_true):
+                    rich[f"oof_{k}"] = vv
+            except Exception:
+                continue
+
+    rich_err = rich.loc[is_err].copy()
+    # Guard: cap size to avoid huge artifacts (still plenty for manual review)
+    if len(rich_err) > max_rows_total:
+        rich_err = rich_err.sort_values(by="abs_margin", ascending=True).head(max_rows_total)
+
+    # Derived subsets: near-threshold vs high-confidence mistakes
+    near = rich_err.sort_values(by="abs_margin", ascending=True).head(topk_near).copy()
+    high_conf = rich_err.sort_values(by="abs_margin", ascending=False).head(topk_conf).copy()
+
+    paths["val_errors_all"] = save_csv_in_output_dir("val_errors_all.csv", rich_err, index=False)
+    paths["val_errors_near_threshold"] = save_csv_in_output_dir("val_errors_near_threshold.csv", near, index=False)
+    paths["val_errors_high_confidence"] = save_csv_in_output_dir("val_errors_high_confidence.csv", high_conf, index=False)
+
+    # 3) Fold summary
+    from sklearn.metrics import confusion_matrix  # type: ignore
+
+    fold_rows: List[Dict[str, Any]] = []
+    n_splits_cfg = int(_select(cfg, "train.n_splits", 5))
+    for f in range(1, n_splits_cfg + 1):
+        msk = (fold_id == f)
+        if not np.any(msk):
+            continue
+        yt = y_true[msk]
+        pp = oof_proba[msk]
+        pr = (pp >= float(threshold)).astype(int)
+        tn, fp, fn, tp = confusion_matrix(yt, pr, labels=[0, 1]).ravel()
+        auc = float(roc_auc_score(yt, pp)) if len(np.unique(yt)) == 2 else float("nan")
+        f1_fixed = float(f1_score(yt, pr)) if len(np.unique(yt)) == 2 else float("nan")
+
+        # fold-local best threshold (for understanding, not for deployment)
+        try:
+            if bool(_select(cfg, "train.optimize_threshold.enable", False)):
+                t_f, f1_f = search_best_threshold(
+                    y_true=yt,
+                    proba=pp,
+                    method=str(_select(cfg, "train.optimize_threshold.method", "pr_curve")),
+                    min_t=float(_select(cfg, "train.optimize_threshold.clamp_min", 0.02)),
+                    max_t=float(_select(cfg, "train.optimize_threshold.clamp_max", 0.98)),
+                    grid_start=float(_select(cfg, "train.optimize_threshold.grid.start", 0.05)),
+                    grid_end=float(_select(cfg, "train.optimize_threshold.grid.end", 0.95)),
+                    grid_step=float(_select(cfg, "train.optimize_threshold.grid.step", 0.01)),
+                )
+            else:
+                t_f, f1_f = float(threshold), float(f1_fixed)
+        except Exception:
+            t_f, f1_f = float("nan"), float("nan")
+
+        fold_rows.append({
+            "fold": int(f),
+            "n": int(msk.sum()),
+            "pos_rate": float(yt.mean()),
+            "auc": float(auc),
+            "f1_at_global_threshold": float(f1_fixed),
+            "best_threshold_fold": float(t_f),
+            "f1_best_fold": float(f1_f),
+            "tp": int(tp),
+            "fp": int(fp),
+            "tn": int(tn),
+            "fn": int(fn),
+            "n_errors": int((pr != yt).sum()),
+        })
+
+    fold_sum = pd.DataFrame(fold_rows).sort_values("fold")
+    paths["val_fold_summary"] = save_csv_in_output_dir("val_fold_summary.csv", fold_sum, index=False)
+
+
+    # 3b) Slice diagnostics: which raw categories are systematically error-prone?
+    # This helps you find "where" the model fails (e.g., 특정 학교/전공/직무에서 오분류가 많음).
+    if bool(_select(cfg, "train.debug.misclassified.slices.enable", True)):
+        max_unique = int(_select(cfg, "train.debug.misclassified.slices.max_unique", 50))
+        min_n = int(_select(cfg, "train.debug.misclassified.slices.min_n", 8))
+        topk_per_col = int(_select(cfg, "train.debug.misclassified.slices.topk_per_col", 10))
+
+        rows: List[Dict[str, Any]] = []
+        # Prefer raw columns (before feature engineering); if you want engineered slices, extend here.
+        for col in list(raw_features_wo_id.columns):
+            s = raw_features_wo_id[col]
+            # Categorical-like columns only (object/category/bool or low-cardinality numeric)
+            is_cat_like = (s.dtype == "object") or (str(s.dtype).startswith("category")) or (str(s.dtype) == "bool")
+            nunq = int(s.nunique(dropna=False))
+            if (not is_cat_like) and nunq <= max_unique:
+                # numeric but low cardinality -> treat as categorical
+                is_cat_like = True
+
+            if not is_cat_like or nunq <= 1 or nunq > max_unique:
+                continue
+
+            grp = pd.DataFrame({
+                "val": s.fillna("__MISSING__").astype(str).values,
+                "is_err": is_err.astype(int),
+                "is_fp": (((y_true == 0) & (pred == 1))).astype(int),
+                "is_fn": (((y_true == 1) & (pred == 0))).astype(int),
+                "y_true": y_true.astype(int),
+            }).groupby("val", dropna=False)
+
+            stat = grp.agg(
+                n=("is_err", "size"),
+                n_err=("is_err", "sum"),
+                n_fp=("is_fp", "sum"),
+                n_fn=("is_fn", "sum"),
+                pos_rate=("y_true", "mean"),
+            ).reset_index()
+
+            stat = stat[stat["n"] >= min_n].copy()
+            if len(stat) == 0:
+                continue
+
+            stat["error_rate"] = stat["n_err"] / stat["n"]
+            stat["fp_rate"] = stat["n_fp"] / stat["n"]
+            stat["fn_rate"] = stat["n_fn"] / stat["n"]
+            stat["feature"] = col
+
+            # Keep only worst slices for this column (high error_rate, then support)
+            stat = stat.sort_values(["error_rate", "n"], ascending=[False, False]).head(topk_per_col) # type: ignore
+            rows.extend(stat.to_dict(orient="records"))
+
+        if rows:
+            slices_df = pd.DataFrame(rows)
+            # Global ranking for quick scan
+            slices_df = slices_df.sort_values(["error_rate", "n"], ascending=[False, False])
+            paths["val_error_slices"] = save_csv_in_output_dir("val_error_slices.csv", slices_df, index=False)
+
+    # 4) Optional: fold-wise error CSVs + zip
+    if per_fold:
+        try:
+            import zipfile
+            try:
+                output_dir = Path(HydraConfig.get().runtime.output_dir)
+            except Exception:
+                output_dir = Path.cwd()
+
+            per_fold_paths: List[Path] = []
+            for f in range(1, n_splits_cfg + 1):
+                df_f = rich_err.loc[rich_err["fold"] == f].copy()
+                if len(df_f) == 0:
+                    continue
+                if len(df_f) > max_rows_per_fold:
+                    df_f = df_f.sort_values(by="abs_margin", ascending=True).head(max_rows_per_fold)
+                p = output_dir / f"fold{f}_val_errors.csv"
+                df_f.to_csv(p, index=False, encoding="utf-8-sig")
+                per_fold_paths.append(p)
+
+            if per_fold_paths:
+                zpath = output_dir / "val_errors_per_fold.zip"
+                with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for p in per_fold_paths:
+                        if p.exists():
+                            zf.write(p, arcname=p.name)
+                paths["val_errors_per_fold_zip"] = zpath
+        except Exception as e:
+            print(f"[Warn] per-fold error report failed: {e}")
+
+    # Console summary (concise; you still have full CSVs)
+    n_err = int(is_err.sum())
+    n_fp = int(np.sum((y_true == 0) & (pred == 1)))
+    n_fn = int(np.sum((y_true == 1) & (pred == 0)))
+    print(f"[ValErrors] threshold={float(threshold):.4f} | misclassified={n_err}/{len(y_true)} (FP={n_fp}, FN={n_fn})")
+    try:
+        # Show a few high-confidence mistakes (these are the ones you should inspect first)
+        preview_cols = [c for c in [id_col, "fold", "y_true", "oof_proba", "pred", "error_type", "abs_margin"] if c in rich_err.columns]
+        head_df = rich_err.sort_values(by="abs_margin", ascending=False).head(5)[preview_cols]
+        print("[ValErrors] High-confidence mistakes (top 5):")
+        print(head_df.to_string(index=False))
+    except Exception:
+        pass
+
+    # Optional: log small diagnostic tables to W&B (avoid huge uploads)
+    if log_to_wandb and run is not None:
+        try:
+            import wandb  # type: ignore
+            small_cols = [c for c in [id_col, "fold", "y_true", "oof_proba", "pred", "error_type", "abs_margin"] if c in rich_err.columns]
+            wandb.log({
+                "val_errors/near_threshold": wandb.Table(dataframe=near[small_cols].head(min(len(near), 200))),
+                "val_errors/high_confidence": wandb.Table(dataframe=high_conf[small_cols].head(min(len(high_conf), 200))),
+            })
+        except Exception:
+            pass
+
+    return paths
+
+
+
+
+
 
 def _safe_name(s: Any, max_len: int = 80) -> str:
     s = "" if s is None else str(s)
@@ -2250,6 +2591,9 @@ def main(cfg: DictConfig) -> None:
     train = normalize_blank_strings_df(train)
     test = normalize_blank_strings_df(test)
 
+    # Keep a raw copy (normalized) for post-CV error analysis (ID + original columns)
+    train_raw_df = train.copy()
+
     if cfg.data.target_col not in train.columns:
         raise ValueError(f"train에 target 컬럼({cfg.data.target_col})이 없습니다.")
 
@@ -2518,6 +2862,33 @@ def main(cfg: DictConfig) -> None:
 
 
 
+    # -------------------------------
+    # Validation diagnostics (OOF)
+    # -------------------------------
+    # Save misclassified samples so you can audit what the model gets wrong during CV.
+    # Files are written under Hydra output_dir (e.g., outputs/YYYY-MM-DD/HH-MM-SS).
+    err_paths: Dict[str, Path] = {}
+    try:
+        err_paths = build_validation_error_reports(
+            cfg=cfg,
+            train_raw_df=train_raw_df,
+            y_true=y.values,
+            oof_proba=oof_proba,
+            threshold=threshold,
+            run=run,
+            oof_parts=oof_parts if isinstance(oof_parts, dict) else None,
+        )
+        # Optionally log key diagnostics as artifacts (keep it small)
+        if run is not None and bool(getattr(cfg.wandb, "log_artifacts", False)) and err_paths:
+            for k in ["val_predictions", "val_errors_all", "val_error_slices", "val_errors_per_fold_zip"]:
+                p = err_paths.get(k)
+                if p is not None and Path(p).exists():
+                    wandb_log_artifact(run, Path(p), name=make_wandb_artifact_name(cfg, run, k), art_type="dataset")
+    except Exception as e:
+        print(f"[Warn] validation error reporting failed: {e}")
+
+
+
     # Save OOF
     oof_path = Path(cfg.train.oof_path)
     oof_df: Dict[str, Any] = {"oof_proba": oof_proba, "y_true": y.values}
@@ -2617,6 +2988,13 @@ def main(cfg: DictConfig) -> None:
                             output_dir / "feature_columns.json",
                             output_dir / "preprocess_meta.yaml",
                             output_dir / "run_info.yaml",
+                            output_dir / "val_predictions.csv",
+                            output_dir / "val_errors_all.csv",
+                            output_dir / "val_errors_near_threshold.csv",
+                            output_dir / "val_errors_high_confidence.csv",
+                            output_dir / "val_fold_summary.csv",
+                            output_dir / "val_error_slices.csv",
+                            output_dir / "val_errors_per_fold.zip",
                         ]
                         for mp in meta_candidates:
                             if mp.exists() and mp.is_file():
@@ -2678,6 +3056,13 @@ def main(cfg: DictConfig) -> None:
                             output_dir / "feature_columns.json",
                             output_dir / "preprocess_meta.yaml",
                             output_dir / "run_info.yaml",
+                            output_dir / "val_predictions.csv",
+                            output_dir / "val_errors_all.csv",
+                            output_dir / "val_errors_near_threshold.csv",
+                            output_dir / "val_errors_high_confidence.csv",
+                            output_dir / "val_fold_summary.csv",
+                            output_dir / "val_error_slices.csv",
+                            output_dir / "val_errors_per_fold.zip",
                         ]
                         for mp in meta_candidates:
                             if mp.exists() and mp.is_file():
