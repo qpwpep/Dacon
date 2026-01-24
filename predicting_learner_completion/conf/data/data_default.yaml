@@ -22,6 +22,12 @@ missing_present_flags:
 # Treat low-cardinality numeric columns as categorical by casting to string then category
 categorical_numeric:
   enable: true
+  # heuristic 대신 allowlist 사용
+  mode: allowlist          # heuristic | allowlist
+  allowlist:
+  - school1
+  - class1
+  - class2
   max_unique: 150          # include coded columns like school1, class1...
   include_bool: true       # whether to include bool cols as categorical
   skip_binary_numeric: true

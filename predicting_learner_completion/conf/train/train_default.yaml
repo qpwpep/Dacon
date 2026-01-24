@@ -41,7 +41,7 @@ catboost:
     allow_writing_files: false
     task_type: "CPU"     # "GPU" 가능(환경에 맞게)
     verbose: ${train.log_period}
-    auto_class_weights: Balanced
+    auto_class_weights: null
 
 # ---------------------------
 # TF-IDF(char ngram) + LogisticRegression (optional)
@@ -75,7 +75,7 @@ tfidf_lr:
     solver: saga
     penalty: l2
     C: 4.0
-    class_weight: balanced
+    class_weight: null
     max_iter: 6000
     n_jobs: -1
 

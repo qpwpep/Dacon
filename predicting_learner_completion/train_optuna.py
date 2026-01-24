@@ -889,13 +889,21 @@ def preprocess_fold_fit(
         if bool(_select(cfg, "data.multilabel.exclude_generated_from_categorical_numeric", True)):
             exclude = exclude + ml_generated_cols
 
-        extra = infer_numeric_categorical_cols(
-            train_df=X_tr,
-            max_unique=int(cfg.data.categorical_numeric.max_unique),
-            include_bool=bool(cfg.data.categorical_numeric.include_bool),
-            exclude=exclude,
-            skip_binary_numeric=bool(_select(cfg, "data.categorical_numeric.skip_binary_numeric", True)),
-        )
+        mode = str(_select(cfg, "data.categorical_numeric.mode", "heuristic")).lower()
+        if mode == "allowlist":
+            allow = list(_select(cfg, "data.categorical_numeric.allowlist", [])) or []
+            # 존재하는 컬럼만 + exclude 제외
+            extra = [c for c in allow if (c in X_tr.columns) and (c not in set(exclude))]
+        elif mode == "heuristic":
+            extra = infer_numeric_categorical_cols(
+                train_df=X_tr,
+                max_unique=int(cfg.data.categorical_numeric.max_unique),
+                include_bool=bool(cfg.data.categorical_numeric.include_bool),
+                exclude=exclude,
+                skip_binary_numeric=bool(_select(cfg, "data.categorical_numeric.skip_binary_numeric", True)),
+            )
+        else:
+            raise ValueError(f"Unknown data.categorical_numeric.mode={mode}")
         cat_cols = sorted(set(cat_cols).union(set(extra)))
 
     # (안전장치) 멀티라벨 파생이 cat_cols에 들어갔으면 제거
@@ -2551,13 +2559,21 @@ def main(cfg: DictConfig) -> None:
         if bool(_select(cfg, "data.multilabel.exclude_generated_from_categorical_numeric", True)):
             exclude = exclude + ml_generated_cols
 
-        extra = infer_numeric_categorical_cols(
-            train_df=X_full,
-            max_unique=int(cfg.data.categorical_numeric.max_unique),
-            include_bool=bool(cfg.data.categorical_numeric.include_bool),
-            exclude=exclude,
-            skip_binary_numeric=bool(_select(cfg, "data.categorical_numeric.skip_binary_numeric", True)),
-        )
+        mode = str(_select(cfg, "data.categorical_numeric.mode", "heuristic")).lower()
+
+        if mode == "allowlist":
+            allow = list(_select(cfg, "data.categorical_numeric.allowlist", [])) or []
+            extra = [c for c in allow if (c in X_full.columns) and (c not in set(exclude))]
+        elif mode == "heuristic":
+            extra = infer_numeric_categorical_cols(
+                train_df=X_full,
+                max_unique=int(cfg.data.categorical_numeric.max_unique),
+                include_bool=bool(cfg.data.categorical_numeric.include_bool),
+                exclude=exclude,
+                skip_binary_numeric=bool(_select(cfg, "data.categorical_numeric.skip_binary_numeric", True)),
+            )
+        else:
+            raise ValueError(f"Unknown data.categorical_numeric.mode={mode}")
         # object + numeric-cat 합치기
         cat_cols = sorted(set(cat_cols).union(set(extra)))
 
