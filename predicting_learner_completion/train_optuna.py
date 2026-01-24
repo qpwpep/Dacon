@@ -1790,7 +1790,7 @@ def cv_train_foldfit(
     feature_columns_ref: List[str],
     save_fold_models: bool = False,
     fold_model_basepath: Optional[Path] = None,
-) -> Tuple[np.ndarray, np.ndarray, List[int], List[float], List[float], List[Path], np.ndarray, Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, Any], np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, List[int], List[float], List[float], List[Path], np.ndarray, Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, Any], np.ndarray, np.ndarray, np.ndarray]:
     """CV 학습 (fold-fit 전처리로 누수 제거).
 
     feature_importance는 fold마다 feature space가 달라질 수 있으므로,
@@ -1851,6 +1851,18 @@ def cv_train_foldfit(
     # Sub(TF-IDF+LR) OOF/test proba (optional)
     oof_tfidf = (np.full(len(X_raw), np.nan, dtype=float) if tfidf_enable else None)
     test_sum_tfidf = (np.zeros(len(test_raw), dtype=float) if tfidf_enable else None)
+
+
+    # Per-fold test probabilities & thresholds (for fold-ensemble decisions)
+    test_fold_probas: Dict[str, List[np.ndarray]] = {"lgb": []}
+    if cb_enable:
+        test_fold_probas["catboost"] = []
+    if tfidf_enable:
+        test_fold_probas["tfidf_lr"] = []
+
+    lgb_fold_thresholds: List[float] = []
+    blend_fold_thresholds: List[float] = []  # filled only if ensemble enabled; otherwise we will use lgb_fold_thresholds
+
 
     # Exact fold assignment (for debugging / error reports)
     fold_id = np.full(len(X_raw), -1, dtype=int)
@@ -1923,6 +1935,9 @@ def cv_train_foldfit(
         proba_te_lgb = model.predict_proba(test_fold, num_iteration=model.best_iteration_)[:, 1]
         test_sum_lgb += proba_te_lgb
 
+        # store per-fold test proba
+        test_fold_probas["lgb"].append(proba_te_lgb)
+
         # Feature importance 누적 (name 기반)
         try:
             names = list(X_tr.columns)
@@ -1959,6 +1974,8 @@ def cv_train_foldfit(
             # optimize_threshold 비활성화면 고정 threshold를 best로 취급
             best_thr = float(fixed_thr)
             f1_lgb = float(f1_fixed_lgb)
+
+        lgb_fold_thresholds.append(best_thr)
 
         aucs_lgb.append(auc_lgb)
         f1s_lgb.append(f1_lgb)
@@ -2013,7 +2030,12 @@ def cv_train_foldfit(
             _lr_params.setdefault("solver", "saga")
             _lr_params.setdefault("penalty", "l2")
             _lr_params.setdefault("C", 4.0)
-            _lr_params.setdefault("class_weight", "balanced")
+            # NOTE: Do NOT force class balancing by default.
+            # Respect config if provided (None/"balanced"/dict). If not provided, keep None (=no class reweighting).
+            _lr_params.setdefault("class_weight", None)
+            cw = _lr_params.get("class_weight", None)
+            if isinstance(cw, str) and cw.strip().lower() in ("none", "null", ""):
+                _lr_params["class_weight"] = None
             _lr_params.setdefault("max_iter", 6000)
             _lr_params.setdefault("n_jobs", -1)
             if str(_lr_params.get("penalty", "l2")).lower() == "elasticnet":
@@ -2035,6 +2057,9 @@ def cv_train_foldfit(
             oof_tfidf[va_idx] = proba_va_tfidf  # type: ignore
             proba_te_tfidf = text_model.predict_proba(Xte_txt)[:, 1]
             test_sum_tfidf += proba_te_tfidf  # type: ignore
+
+            # store per-fold test proba
+            test_fold_probas["tfidf_lr"].append(proba_te_tfidf)
 
             auc_tfidf = float(roc_auc_score(y_va, proba_va_tfidf))
             fixed_thr = float(cfg.train.threshold)
@@ -2110,6 +2135,9 @@ def cv_train_foldfit(
 
             proba_te_cb = cb_model.predict_proba(test_fold)[:, 1]
             test_sum_cb += proba_te_cb  # type: ignore
+
+            # store per-fold test proba
+            test_fold_probas["catboost"].append(proba_te_cb)
 
             auc_cb = float(roc_auc_score(y_va, proba_va_cb))
             f1_fixed_cb = float(f1_score(y_va, (proba_va_cb >= fixed_thr).astype(int)))
@@ -2316,6 +2344,15 @@ def cv_train_foldfit(
         oof_proba = _mix_proba(best_weights, oof_parts)
         test_proba_mean = _mix_proba(best_weights, test_parts)
 
+        # Per-fold mixed test probabilities (for median-proba / hard-vote decisions)
+        _test_folds: List[np.ndarray] = []
+        for i in range(n_splits):
+            pf = np.zeros(len(test_raw), dtype=float)
+            for k, w in best_weights.items():
+                pf += float(w) * np.asarray(test_fold_probas[k][i])
+            _test_folds.append(pf)
+        test_proba_folds = np.vstack(_test_folds)  # shape: (n_folds, n_test)
+
         ensemble_meta = {
             "enable": 1,
             "weight_search_enable": int(weight_search_enable),
@@ -2358,6 +2395,7 @@ def cv_train_foldfit(
                 t_mix = float(fixed_thr)
 
             aucs.append(auc_mix)
+            blend_fold_thresholds.append(t_mix)
             f1s.append(f1_mix)
 
             # Per-fold logging
@@ -2382,6 +2420,10 @@ def cv_train_foldfit(
             sum_payload[f"ensemble/best_w_{k}"] = float(w)
         wandb_log(run, sum_payload)
 
+        # Fold-specific optimal thresholds (computed on each fold's validation split)
+        fold_thresholds = np.asarray(blend_fold_thresholds, dtype=float)
+
+
     else:
         # LGB-only
         oof_proba = oof_lgb
@@ -2389,10 +2431,13 @@ def cv_train_foldfit(
         aucs = aucs_lgb
         f1s = f1s_lgb
 
+        test_proba_folds = np.vstack(test_fold_probas["lgb"])  # shape: (n_folds, n_test)
+        fold_thresholds = np.asarray(lgb_fold_thresholds, dtype=float)
+
     # feature importance를 reference column에 맞춰 정렬
     feat_imp_mean = np.array([feat_imp_sum.get(c, 0.0) / n_splits for c in feature_columns_ref], dtype=float)
 
-        # Integrity checks: every row must be predicted exactly once in OOF
+    # Integrity checks: every row must be predicted exactly once in OOF
     if np.any(fold_id < 0):
         bad = np.where(fold_id < 0)[0][:20]
         raise RuntimeError(f"[CV] fold_id not filled for some rows. Example indices: {bad.tolist()}")
@@ -2406,7 +2451,7 @@ def cv_train_foldfit(
         bad = np.where(np.isnan(oof_tfidf))[0][:20]
         raise RuntimeError(f"[CV] oof_tfidf contains NaNs. Example indices: {bad.tolist()}")
 
-    return oof_proba, test_proba_mean, best_iters, aucs, f1s, fold_model_paths, feat_imp_mean, oof_parts, test_parts, ensemble_meta, fold_id
+    return oof_proba, test_proba_mean, best_iters, aucs, f1s, fold_model_paths, feat_imp_mean, oof_parts, test_parts, ensemble_meta, fold_id, test_proba_folds, fold_thresholds
 
 
 
@@ -2675,7 +2720,7 @@ def main(cfg: DictConfig) -> None:
     save_fold_models = bool(cfg.train.save_model) and use_fold_ensemble
     fold_model_basepath = Path(cfg.train.model_path) if save_fold_models else None
 
-    oof_proba, test_proba_cv, best_iters, aucs, f1s, fold_model_paths, cv_feat_imp, oof_parts, test_parts, ensemble_meta, cv_fold_id = cv_train_foldfit(
+    oof_proba, test_proba_cv, best_iters, aucs, f1s, fold_model_paths, cv_feat_imp, oof_parts, test_parts, ensemble_meta, cv_fold_id, test_proba_folds, fold_thresholds = cv_train_foldfit(
         cfg, X_raw, y, test_raw, run, feature_columns_ref=list(X_full.columns),
         save_fold_models=save_fold_models,
         fold_model_basepath=fold_model_basepath,
@@ -2795,16 +2840,44 @@ def main(cfg: DictConfig) -> None:
 
     # Predict
     if use_fold_ensemble:
-        test_proba = test_proba_cv
+        # Fold-ensemble decision rule:
+        # - mean_proba  : mean over fold probabilities (legacy)
+        # - median_proba: median over fold probabilities (more robust to fold calibration drift)
+        # - hard_vote   : per-fold thresholding + majority vote (recommended when fold calibration differs)
+        decision = str(_select(cfg, "train.fold_ensemble_decision", "hard_vote")).strip().lower()
+
         final_model = None
-        print(f"[Predict] Using fold-ensemble proba (mean over {cfg.train.n_splits} folds)")
+
+        if decision in ("median", "median_proba", "median-proba"):
+            test_proba = np.median(test_proba_folds, axis=0)
+            test_pred = (test_proba >= threshold).astype(int)
+            print(f"[Predict] Using fold-ensemble proba (median over {cfg.train.n_splits} folds)")
+
+        elif decision in ("hard_vote", "hard-vote", "vote", "threshold_vote", "threshold-vote"):
+            if fold_thresholds is None or len(fold_thresholds) != int(cfg.train.n_splits):
+                raise RuntimeError(
+                    f"[Predict] fold_thresholds is invalid. Expected n_folds={int(cfg.train.n_splits)}, got {0 if fold_thresholds is None else len(fold_thresholds)}"
+                )
+            # vote fraction in [0,1]; store as "proba" for convenience
+            majority = float(_select(cfg, "train.hard_vote_majority", 0.5))  # e.g., 0.5 / 0.6 / 0.8
+            votes = (test_proba_folds >= fold_thresholds.reshape(-1, 1)).astype(int)
+            vote_frac = votes.mean(axis=0)
+            test_proba = vote_frac
+            test_pred = (vote_frac >= majority).astype(int)
+            print(f"[Predict] Using fold-ensemble hard vote (fold-specific thresholds, majority vote over {cfg.train.n_splits} folds, majority: {cfg.train.hard_vote_majority})")
+
+        else:
+            # Default / legacy: mean probabilities
+            test_proba = test_proba_cv
+            test_pred = (test_proba >= threshold).astype(int)
+            print(f"[Predict] Using fold-ensemble proba (mean over {cfg.train.n_splits} folds)")
+
     else:
         final_model, test_proba = fit_final_and_predict(cfg, X_full, y, test_full, cat_cols_full, best_iter_final)
+        test_pred = (test_proba >= threshold).astype(int)
         print("[Predict] Using single final model fit on full data")
 
-    test_pred = (test_proba >= threshold).astype(int)
-
-    # Submission
+# Submission
     out_path = Path(cfg.train.out_path)
     if sample_submission_path.exists():
         sub = pd.read_csv(sample_submission_path)
@@ -2843,6 +2916,19 @@ def main(cfg: DictConfig) -> None:
                 f.write(f"use_fold_ensemble: {use_fold_ensemble}\n")
                 f.write(f"n_folds: {int(cfg.train.n_splits)}\n")
                 f.write(f"threshold: {float(threshold)}\n")
+                try:
+                    decision = str(_select(cfg, "train.fold_ensemble_decision", "hard_vote")).strip().lower()
+                except Exception:
+                    decision = "hard_vote"
+                f.write(f"fold_ensemble_decision: {decision}\n")
+                if decision in ("hard_vote", "hard-vote", "vote", "threshold_vote", "threshold-vote"):
+                    f.write("hard_vote_majority_threshold: 0.5\n")
+                    try:
+                        f.write("fold_thresholds:\n")
+                        for t in list(map(float, fold_thresholds.tolist())):
+                            f.write(f"  - {t}\n")
+                    except Exception:
+                        pass
                 f.write("fold_model_paths:\n")
                 for fp in fold_model_paths:
                     f.write(f"  - {str(fp)}\n")
