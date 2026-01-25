@@ -1002,14 +1002,52 @@ def preprocess_fold_fit(
 
 
 
-def maybe_init_wandb(cfg: DictConfig):
+def get_output_dir() -> Path:
+    """Return the directory where *all* run artifacts should be written.
+
+    - Under Hydra: use HydraConfig.get().runtime.output_dir (typically outputs/YYYY-MM-DD/HH-MM-SS).
+    - Without Hydra (fallback): use ./outputs under the current working directory.
+
+    This function also ensures the directory exists.
+    """
+    try:
+        output_dir = Path(HydraConfig.get().runtime.output_dir)
+    except Exception:
+        output_dir = Path.cwd() / "outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def resolve_output_path(path_like: Any, *, output_dir: Optional[Path] = None) -> Path:
+    """Resolve a (possibly relative) path to live under output_dir.
+
+    If `path_like` is an absolute path, it is returned as-is.
+    Otherwise, the returned path is: output_dir / path_like.
+    The parent directory is created.
+    """
+    if output_dir is None:
+        output_dir = get_output_dir()
+    p = Path(str(path_like))
+    if not p.is_absolute():
+        p = output_dir / p
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def maybe_init_wandb(cfg: DictConfig, output_dir: Optional[Path] = None):
     if not cfg.wandb.enable:
         return None
 
     try:
         import wandb # type: ignore
 
+        # Ensure wandb writes under outputs/ as well (important when hydra.job.chdir=false)
+        od = output_dir or get_output_dir()
+        wandb_dir = od / "wandb"
+        wandb_dir.mkdir(parents=True, exist_ok=True)
+
         run = wandb.init( # type: ignore
+            dir=str(wandb_dir),
             project=cfg.wandb.project,
             entity=cfg.wandb.entity,
             mode=cfg.wandb.mode,
@@ -1036,13 +1074,7 @@ def wandb_log(run, payload: Dict[str, Any], step: Optional[int] = None) -> None:
 
 def save_yaml_in_output_dir(filename: str, payload: Dict[str, Any]) -> Path:
     """Save payload as YAML into Hydra output dir (e.g., outputs/YYYY-MM-DD/HH-MM-SS)."""
-    try:
-        output_dir = Path(HydraConfig.get().runtime.output_dir)
-    except Exception:
-        # Fallback: current working directory (Hydra usually chdir's into output dir)
-        output_dir = Path.cwd()
-
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = get_output_dir()
     out_path = output_dir / filename
 
     cfg_obj = OmegaConf.create(payload)
@@ -1052,11 +1084,7 @@ def save_yaml_in_output_dir(filename: str, payload: Dict[str, Any]) -> Path:
 
 def save_json_in_output_dir(filename: str, obj: Any) -> Path:
     """Save JSON under Hydra output_dir (or cwd fallback)."""
-    try:
-        output_dir = Path(HydraConfig.get().runtime.output_dir)
-    except Exception:
-        output_dir = Path.cwd()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = get_output_dir()
     out_path = output_dir / filename
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
@@ -1065,11 +1093,7 @@ def save_json_in_output_dir(filename: str, obj: Any) -> Path:
 
 def save_csv_in_output_dir(filename: str, df: pd.DataFrame, index: bool = False) -> Path:
     """Save CSV under Hydra output_dir (or cwd fallback)."""
-    try:
-        output_dir = Path(HydraConfig.get().runtime.output_dir)
-    except Exception:
-        output_dir = Path.cwd()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = get_output_dir()
     out_path = output_dir / filename
     df.to_csv(out_path, index=index, encoding="utf-8-sig")
     return out_path
@@ -2477,8 +2501,20 @@ def fit_final_and_predict(
 def main(cfg: DictConfig) -> None:
     print("[Config]\n" + OmegaConf.to_yaml(cfg))
 
+    # Centralized output directory: force *all* artifacts under outputs/ (even if hydra.job.chdir=false)
+    output_dir = get_output_dir()
+    print(f"[Output] artifacts will be written under: {output_dir}")
+
     seed_everything(int(cfg.train.seed))
-    run = maybe_init_wandb(cfg)
+    run = maybe_init_wandb(cfg, output_dir=output_dir)
+
+    # Resolve key artifact paths early (always under output_dir when relative)
+    oof_path = resolve_output_path(getattr(cfg.train, "oof_path", "oof_proba.csv"), output_dir=output_dir)
+    out_path = resolve_output_path(getattr(cfg.train, "out_path", "submission.csv"), output_dir=output_dir)
+    proba_path: Optional[Path] = None
+    if getattr(cfg.train, "out_proba_path", None):
+        proba_path = resolve_output_path(cfg.train.out_proba_path, output_dir=output_dir)
+    model_path = resolve_output_path(getattr(cfg.train, "model_path", "final_model.txt"), output_dir=output_dir)
 
     # Save resolved config for reproducibility (included in fold model bundle under meta/)
     try:
@@ -2718,7 +2754,7 @@ def main(cfg: DictConfig) -> None:
     # CV (+ fold-ensemble prediction)
     use_fold_ensemble = bool(getattr(cfg.train, "use_fold_ensemble", True))
     save_fold_models = bool(cfg.train.save_model) and use_fold_ensemble
-    fold_model_basepath = Path(cfg.train.model_path) if save_fold_models else None
+    fold_model_basepath = model_path if save_fold_models else None
 
     oof_proba, test_proba_cv, best_iters, aucs, f1s, fold_model_paths, cv_feat_imp, oof_parts, test_parts, ensemble_meta, cv_fold_id, test_proba_folds, fold_thresholds = cv_train_foldfit(
         cfg, X_raw, y, test_raw, run, feature_columns_ref=list(X_full.columns),
@@ -2824,7 +2860,7 @@ def main(cfg: DictConfig) -> None:
 
 
     # Save OOF
-    oof_path = Path(cfg.train.oof_path)
+    # oof_path already resolved under output_dir
     oof_df: Dict[str, Any] = {"oof_proba": oof_proba, "y_true": y.values}
     # Also save per-model OOF components for easy ensembling/debugging
     if isinstance(oof_parts, dict):
@@ -2878,7 +2914,7 @@ def main(cfg: DictConfig) -> None:
         print("[Predict] Using single final model fit on full data")
 
 # Submission
-    out_path = Path(cfg.train.out_path)
+    # out_path already resolved under output_dir
     if sample_submission_path.exists():
         sub = pd.read_csv(sample_submission_path)
         if cfg.data.target_col not in sub.columns:
@@ -2894,8 +2930,8 @@ def main(cfg: DictConfig) -> None:
     print("Saved submission:", out_path)
 
     # Probabilities
-    if cfg.train.out_proba_path:
-        proba_path = Path(cfg.train.out_proba_path)
+    if proba_path is not None:
+        # proba_path already resolved under output_dir
         pd.DataFrame({f"{cfg.data.target_col}_proba": test_proba}).to_csv(proba_path, index=False)
         print("Saved proba:", proba_path)
 
@@ -2905,7 +2941,7 @@ def main(cfg: DictConfig) -> None:
 
     # Save model
     if bool(cfg.train.save_model):
-        model_path = Path(cfg.train.model_path)
+        # model_path already resolved under output_dir
 
         if use_fold_ensemble:
             # fold 모델은 cv_train에서 이미 저장됨(save_fold_models=True일 때)
@@ -3090,8 +3126,8 @@ def main(cfg: DictConfig) -> None:
         if bool(cfg.wandb.log_artifacts):
             if out_path.exists():
                 wandb_log_artifact(run, out_path, name=make_wandb_artifact_name(cfg, run, "submission"), art_type="output")
-            if cfg.train.out_proba_path and Path(cfg.train.out_proba_path).exists():
-                wandb_log_artifact(run, Path(cfg.train.out_proba_path), name=make_wandb_artifact_name(cfg, run, "submission_proba"), art_type="output")
+            if proba_path is not None and proba_path.exists():
+                wandb_log_artifact(run, proba_path, name=make_wandb_artifact_name(cfg, run, "submission_proba"), art_type="output")
 
             # Model artifacts
             if bool(cfg.train.save_model):
@@ -3101,7 +3137,6 @@ def main(cfg: DictConfig) -> None:
                     elif manifest_path is not None and manifest_path.exists():
                         wandb_log_artifact(run, manifest_path, name=make_wandb_artifact_name(cfg, run, "fold_model_manifest"), art_type="model")
                 else:
-                    model_path = Path(cfg.train.model_path)
                     if model_bundle_path is not None and Path(model_bundle_path).exists():
                         wandb_log_artifact(
                             run,
