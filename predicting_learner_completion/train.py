@@ -880,7 +880,7 @@ def preprocess_fold_fit(
             X_tr, other, dropped_const = drop_constant_cols(X_tr, other)
 
     # ---- 3) categorical cols 결정 (fit은 X_tr 기준)
-    cat_cols = X_tr.select_dtypes(include=["object"]).columns.tolist()
+    cat_cols = X_tr.select_dtypes(include=["object", "string"]).columns.tolist()
 
     if bool(cfg.data.categorical_numeric.enable):
         exclude = list(cfg.data.categorical_numeric.exclude)
@@ -2631,7 +2631,7 @@ def main(cfg: DictConfig) -> None:
         X_full, test_full, dropped_const = drop_constant_cols(X_full, test_full)
 
     # 어떤 컬럼을 category로 볼지 결정
-    cat_cols_full = X_full.select_dtypes(include=["object"]).columns.tolist()
+    cat_cols_full = X_full.select_dtypes(include=["object", "string"]).columns.tolist()
     cat_cols = list(cat_cols_full)
 
     if bool(cfg.data.categorical_numeric.enable):
