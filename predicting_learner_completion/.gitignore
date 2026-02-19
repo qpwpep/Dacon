@@ -702,6 +702,7 @@ baseline.ipynb
 *.csv
 /cache
 final_model*
+*.png
 
 # wandb
 /wandb

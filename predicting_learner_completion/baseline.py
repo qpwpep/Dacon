@@ -1,233 +1,132 @@
+import pandas as pd  # type: ignore
+import numpy as np  # type: ignore
 
-import argparse
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
-
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score, f1_score
-
-import lightgbm as lgb
+from sklearn.compose import ColumnTransformer  # type: ignore
+from sklearn.pipeline import Pipeline  # type: ignore
+from sklearn.impute import SimpleImputer  # type: ignore
+from sklearn.preprocessing import TargetEncoder  # type: ignore
+from sklearn.ensemble import RandomForestClassifier  # type: ignore
 
 
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """대회 컬럼 구성에 맞춘 최소 파생피처."""
-    df = df.copy()
+def main():
+    # -----------------------------
+    # 1) Load
+    # -----------------------------
+    train = pd.read_csv("data/train.csv")
+    test = pd.read_csv("data/test.csv")
 
-    # major_field 기반 파생피처 (존재할 때만)
-    if "major_field" in df.columns:
-        s = df["major_field"].astype("object")
-        s = s.fillna("__MISSING__").astype(str)
-        df["major_field"] = s
-        df["is_major_it"] = s.str.contains("IT", regex=False).astype(int)
+    TARGET = "completed"
+    FEATURES = ["class1", "re_registration", "inflow_route", "time_input", "is_major_it"]
 
-    return df
+    # -----------------------------
+    # 2) Drop columns with too many missings (train 기준)
+    #    + 안전하게 errors='ignore'
+    # -----------------------------
+    missing_ratio = train.drop(columns=[TARGET], errors="ignore").isnull().mean()
+    columns_to_drop = missing_ratio[missing_ratio > 0.8].index.tolist()
+    columns_to_drop.append("incumbents_lecture_scale_reason")
 
+    train = train.drop(columns=columns_to_drop, errors="ignore")
+    test = test.drop(columns=columns_to_drop, errors="ignore")
 
-def drop_high_missing_cols(train_df: pd.DataFrame, test_df: pd.DataFrame, threshold: float):
-    """train 기준 결측률이 threshold 초과인 컬럼 드랍."""
-    miss = train_df.isna().mean()
-    drop_cols = miss[miss > threshold].index.tolist()
-    return train_df.drop(columns=drop_cols), test_df.drop(columns=drop_cols, errors="ignore"), drop_cols
+    # -----------------------------
+    # 3) Feature engineering: is_major_it
+    #    major_field가 드랍되었을 가능성도 고려
+    # -----------------------------
+    for df in (train, test):
+        if "major_field" in df.columns:
+            # na=False로 NaN 안전 처리
+            df["is_major_it"] = (
+                df["major_field"].astype("string").str.contains("IT", regex=True, na=False).astype(int)
+            )
+        else:
+            df["is_major_it"] = 0
 
+    # -----------------------------
+    # 4) Select features/target
+    # -----------------------------
+    X_train = train[FEATURES].copy()
+    y_train = train[TARGET].copy()
+    X_test = test[FEATURES].copy()
 
-def make_categorical_safe(
-    train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    target_col: str = "completed",
-):
-    """
-    object 컬럼을 pandas category로 변환.
-    - train에서 본 카테고리 + __UNKNOWN__ + __MISSING__ 만 허용
-    - test에서 train에 없던 값은 __UNKNOWN__으로 매핑
-    """
-    train_df = train_df.copy()
-    test_df = test_df.copy()
+    # -----------------------------
+    # 5) Categorical vs Numeric split
+    #    - 기본: dtype 기반
+    #    - 추가: 명시적으로 범주 취급하고 싶은 컬럼은 force_categorical에 넣기
+    # -----------------------------
+    force_categorical = ["class1", "re_registration", "inflow_route"]
 
-    # 타깃/ID 제거는 밖에서 하는 걸 권장하지만, 혹시 남아있으면 방어
-    for c in [target_col]:
-        if c in train_df.columns:
-            pass
+    categorical_cols = X_train.select_dtypes(include=["object", "string", "bool", "category"]).columns.tolist()
+    for c in force_categorical:
+        if c in X_train.columns and c not in categorical_cols:
+            categorical_cols.append(c)
 
-    cat_cols = train_df.select_dtypes(include=["object"]).columns.tolist()
+    numeric_cols = [c for c in FEATURES if c not in categorical_cols]
 
-    categories_map = {}
-    for col in cat_cols:
-        tr = train_df[col].astype("object").fillna("__MISSING__").astype(str)
-        # train에서 등장한 카테고리만 기반으로 categories 고정 (+ unknown token)
-        cats = pd.Index(tr.unique()).append(pd.Index(["__UNKNOWN__"]))
-        cats = cats.drop_duplicates()
+    # 범주형은 문자열로 통일(타겟 인코더가 category로 처리하게)
+    for c in categorical_cols:
+        X_train[c] = X_train[c].astype("string")
+        X_test[c] = X_test[c].astype("string")
 
-        train_df[col] = pd.Categorical(tr, categories=cats)
+    # -----------------------------
+    # 6) Preprocess
+    #    - Cat: missing -> "__MISSING__", then TargetEncoder(cv=5 cross-fitting)
+    #    - Num: median impute
+    # -----------------------------
+    transformers = []
 
-        te = test_df[col].astype("object").fillna("__MISSING__").astype(str)
-        te = te.where(te.isin(cats), "__UNKNOWN__")
-        test_df[col] = pd.Categorical(te, categories=cats)
+    if categorical_cols:
+        cat_pipe = Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="constant", fill_value="__MISSING__")),
+                # sklearn TargetEncoder는 내부적으로 cv cross-fitting을 수행해 누수를 줄임
+                ("target_enc", TargetEncoder(cv=5, shuffle=True, random_state=42)),
+            ]
+        )
+        transformers.append(("cat", cat_pipe, categorical_cols))
 
-        categories_map[col] = cats
+    if numeric_cols:
+        num_pipe = Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+            ]
+        )
+        transformers.append(("num", num_pipe, numeric_cols))
 
-    return train_df, test_df, cat_cols
-
-
-def main(args):
-    train_path = Path(args.train_path)
-    test_path = Path(args.test_path)
-
-    train = pd.read_csv(train_path)
-    test = pd.read_csv(test_path)
-
-    if args.target_col not in train.columns:
-        raise ValueError(f"train에 target 컬럼({args.target_col})이 없습니다.")
-
-    y = train[args.target_col].astype(int)
-    X = train.drop(columns=[args.target_col])
-
-    # ID 제거(있으면)
-    if args.id_col in X.columns:
-        X = X.drop(columns=[args.id_col])
-    if args.id_col in test.columns:
-        test = test.drop(columns=[args.id_col])
-
-    # 파생피처
-    X = build_features(X)
-    test = build_features(test)
-
-    # 결측률 높은 컬럼 드랍(train 기준)
-    X, test, dropped = drop_high_missing_cols(X, test, threshold=args.drop_missing_threshold)
-    print(f"[Info] Dropped {len(dropped)} columns by missing>{args.drop_missing_threshold}: {dropped}")
-
-    # object -> category (unknown 안전 처리)
-    X, test, cat_cols = make_categorical_safe(X, test, target_col=args.target_col)
-    print(f"[Info] Categorical columns: {len(cat_cols)}")
-
-    # LightGBM 파라미터
-    # (기본은 AUC 기준, 불균형 약간 있으니 is_unbalance=True도 괜찮음)
-    params = dict(
-        objective="binary",
-        learning_rate=args.learning_rate,
-        n_estimators=args.n_estimators,   # early stopping으로 best_iteration 사용
-        num_leaves=args.num_leaves,
-        max_depth=args.max_depth,
-        min_child_samples=args.min_child_samples,
-        subsample=args.subsample,
-        colsample_bytree=args.colsample_bytree,
-        reg_alpha=args.reg_alpha,
-        reg_lambda=args.reg_lambda,
-        random_state=args.seed,
-        n_jobs=-1,
-        verbose=-1
-        # 불균형 대응 (둘 중 하나만 써도 됨)
-        is_unbalance=args.is_unbalance,
+    preprocess = ColumnTransformer(
+        transformers=transformers,
+        remainder="drop",
+        verbose_feature_names_out=True,
     )
 
-    skf = StratifiedKFold(n_splits=args.n_splits, shuffle=True, random_state=args.seed)
+    # -----------------------------
+    # 7) Model
+    # -----------------------------
+    model = RandomForestClassifier(
+        n_estimators=500,
+        random_state=42,
+        n_jobs=-1,
+        class_weight="balanced_subsample",
+    )
 
-    oof_proba = np.zeros(len(X), dtype=float)
-    best_iters = []
-    aucs = []
-    f1s = []
+    clf = Pipeline(
+        steps=[
+            ("preprocess", preprocess),
+            ("model", model),
+        ]
+    )
 
-    print("\n[CV] Start")
-    for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y), start=1):
-        X_tr, y_tr = X.iloc[tr_idx], y.iloc[tr_idx]
-        X_va, y_va = X.iloc[va_idx], y.iloc[va_idx]
+    clf.fit(X_train, y_train)
 
-        model = lgb.LGBMClassifier(**params)
+    # -----------------------------
+    # 8) Predict & Save submission
+    # -----------------------------
+    pred = clf.predict(X_test)
 
-        model.fit(
-            X_tr, y_tr,
-            eval_set=[(X_va, y_va)],
-            eval_metric="auc",
-            callbacks=[
-                lgb.early_stopping(stopping_rounds=args.early_stopping_rounds, verbose=False),
-                lgb.log_evaluation(period=args.log_period),
-            ],
-            categorical_feature=cat_cols,  # pandas category라서 없어도 인식되지만 명시해도 OK
-        )
-
-        proba = model.predict_proba(X_va, num_iteration=model.best_iteration_)[:, 1]
-        oof_proba[va_idx] = proba
-
-        auc = roc_auc_score(y_va, proba)
-        pred = (proba >= args.threshold).astype(int)
-        f1 = f1_score(y_va, pred)
-
-        aucs.append(auc)
-        f1s.append(f1)
-        best_iters.append(model.best_iteration_)
-
-        print(f"[Fold {fold}] best_iter={model.best_iteration_} | AUC={auc:.5f} | F1@{args.threshold}={f1:.5f}")
-
-    print("\n[CV] Done")
-    print(f"AUC mean={np.mean(aucs):.5f} ± {np.std(aucs):.5f}")
-    print(f"F1  mean={np.mean(f1s):.5f} ± {np.std(f1s):.5f}")
-    best_iter_final = int(np.median(best_iters))
-    print(f"Use n_estimators={best_iter_final} (median best_iteration) for final fit")
-
-    # 최종 학습(전체 데이터)
-    final_params = params.copy()
-    final_params["n_estimators"] = best_iter_final
-    final_model = lgb.LGBMClassifier(**final_params)
-    final_model.fit(X, y, categorical_feature=cat_cols)
-
-    test_proba = final_model.predict_proba(test)[:, 1]
-    test_pred = (test_proba >= args.threshold).astype(int)
-
-    # 제출 파일 생성
-    out_path = Path(args.out_path)
-    if args.sample_submission_path and Path(args.sample_submission_path).exists():
-        sub = pd.read_csv(args.sample_submission_path)
-        sub[args.target_col] = test_pred
-        sub.to_csv(out_path, index=False)
-    else:
-        # sample_submission이 없으면 최소 형태로 생성
-        sub = pd.DataFrame({args.target_col: test_pred})
-        sub.to_csv(out_path, index=False)
-
-    # 확률도 같이 저장(선택)
-    if args.out_proba_path:
-        proba_path = Path(args.out_proba_path)
-        pd.DataFrame({f"{args.target_col}_proba": test_proba}).to_csv(proba_path, index=False)
-        print(f"Saved proba:", proba_path)
-
-    print("Saved submission:", out_path)
+    submission = pd.read_csv("data/sample_submission.csv")
+    submission[TARGET] = pred
+    submission.to_csv("submit.csv", index=False)
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--train_path", type=str, default="train.csv")
-    p.add_argument("--test_path", type=str, default="test.csv")
-    p.add_argument("--sample_submission_path", type=str, default="sample_submission.csv")
-    p.add_argument("--out_path", type=str, default="submit_lgbm.csv")
-    p.add_argument("--out_proba_path", type=str, default="submit_lgbm_proba.csv")
-
-    p.add_argument("--target_col", type=str, default="completed")
-    p.add_argument("--id_col", type=str, default="ID")
-
-    p.add_argument("--n_splits", type=int, default=5)
-    p.add_argument("--seed", type=int, default=42)
-
-    p.add_argument("--drop_missing_threshold", type=float, default=0.8)
-
-    # LGBM params
-    p.add_argument("--learning_rate", type=float, default=0.05)
-    p.add_argument("--n_estimators", type=int, default=5000)
-    p.add_argument("--num_leaves", type=int, default=63)
-    p.add_argument("--max_depth", type=int, default=-1)
-    p.add_argument("--min_child_samples", type=int, default=20)
-    p.add_argument("--subsample", type=float, default=0.8)
-    p.add_argument("--colsample_bytree", type=float, default=0.8)
-    p.add_argument("--reg_alpha", type=float, default=0.0)
-    p.add_argument("--reg_lambda", type=float, default=0.0)
-    p.add_argument("--is_unbalance", action="store_true")  # 기본 False, 켜고 싶으면 옵션 주기
-
-    # train control
-    p.add_argument("--early_stopping_rounds", type=int, default=200)
-    p.add_argument("--log_period", type=int, default=200)
-
-    # submission
-    p.add_argument("--threshold", type=float, default=0.5)
-
-    args = p.parse_args()
-    main(args)
+    main()
